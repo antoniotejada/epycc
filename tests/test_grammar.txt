@@ -1,0 +1,102 @@
+() all:
+#    simple
+#     left-recursive
+#     right-recursive
+#     indirect-left-recursive
+#     indirect-right-recursive
+#    optional opt
+#    line-comment
+#    newline
+#    function
+    backtrack-success
+
+() simple:
+    uppers
+
+() optional:
+    nums
+    cap-strings
+    no-lowers
+
+() left-recursive:
+# ab(cd)*
+    ab
+    left-recursive cd
+    
+() right-recursive:
+# (gh)*ef
+    ef
+    gh right-recursive
+
+() indirect-left-recursive:
+# ij|(mn|(ij|(mn|()op)kl)op)kl
+    ij
+    indirect-left-recursive-leaf kl
+
+() indirect-left-recursive-leaf:
+    mn
+    indirect-left-recursive op
+
+() indirect-right-recursive:
+# qr|stuv|stwxqr|stwxstuv|stwxstwxqr
+    qr
+    st indirect-right-recursive-leaf
+
+() indirect-right-recursive-leaf:
+    uv
+    wx indirect-right-recursive
+
+() lowers: one of
+    a b c d e f g h i j k l m n o p q r s t u v w x y z
+
+() uppers: one of
+    A B C D E F G H I J K L M N O P Q R S T U V W X Y Z
+
+() nums: one of
+    1 2 3 4 5 6 7 8 9 0
+
+() no-lowers: none of
+    a b c d e f g h i j k l m n o p q r s t u v w x y z
+
+() cap-strings: one of
+    AUTO
+    GOTO 
+    BREAK
+() non-newline-sequence:
+    non-newline
+    non-newline-sequence non-newline 
+() non-newline: none of
+    \n
+() newline: one of
+    \n
+() line-comment: 
+    # non-newline-sequence
+
+() type-qual:
+    ID
+
+() type-name:
+    ID
+
+() identifier:
+    ID
+
+() function:
+# ["ID", "ID", "(", "ID", "ID", ",", "ID", "ID", ")"]
+    type-declarator identifier ( parameters )
+
+() type-declarator:
+    type-qual opt type-name
+
+() parameters:
+    parameter
+    parameter , parameters
+
+() parameter:
+    type-name type-qual identifier
+    type-name identifier
+
+# Test that we are able to backtrack tagging a success as failure
+() backtrack-success:
+    type-qual
+    type-name identifier

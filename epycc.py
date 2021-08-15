@@ -21,40 +21,22 @@ were directories
 """
 
 # See ISO/IEC 9899:1999 Annex A (aka C99) or ISO/IEC 9899:TC2 6.4.1 
+# See 
+# Packrat parsers can support left recursion
+# http://web.cs.ucla.edu/~todd/research/pepm08.pdf
+# Packrat Parsing: Simple, Powerful, Lazy, Linear Time
+# https://pdos.csail.mit.edu/~baford/packrat/icfp02/packrat-icfp02.pdf
+# Lexer Hack
+# https://en.wikipedia.org/wiki/Lexer_hack
+# C99 Yacc and Lex
+# http://www.quut.com/c/ANSI-C-grammar-l-1999.html
+# http://www.quut.com/c/ANSI-C-grammar-y-1999.html
+# https://stackoverflow.com/questions/44141686/how-to-make-c-language-context-free
 import re
 import string
 import StringIO
+from cstruct import Struct
 
-
-class ClassStruct:
-    """
-    Memory lightweight class
-    """
-    __slots__ = ["field1", "field2"]
-    def __init__(self, field1, field2):
-        self.field1 = field1
-        self.field2 = field2
-
-class Struct:
-    """
-    C-like struct
-
-    use with 
-    my_struct = Struct(field1=value1, field2=value2)
-    my_struct.field1 = blah
-
-    new fields can also be added after the fact with
-    my_struct.field3 = blah
-    """
-    def __init__(self, **kwds):
-        self.__dict__.update(kwds)
-    def __repr__(self):
-        # XXX This may be making the debugger stall when there are lots of 
-        #     linked states?
-        s = []
-        for key in self.__dict__:
-            s += ["%s: %s" % (key, self.__dict__[key])]
-        return string.join(s, ", ")
 
 def vrb(*args):
     if (False):
@@ -369,8 +351,8 @@ def create_nfa(first, last):
 
 def build_string_nfa(s):
     # Create first and last dummy states and the nfa for this string
-    first_state = create_state(name="%s-first" % s)
-    last_state = create_state(name="%s-last" % s)
+    first_state = create_state(name="%s" % s)
+    last_state = create_state(name="@%s#last" % s)
     nfa = create_nfa(first_state, last_state)
 
     # Create one state per char, linking the first dummy state to the first
@@ -390,8 +372,8 @@ def build_string_nfa(s):
 
 def build_charset_nfa(name, charset, negated):
     # Create first and last dummy states and the nfa for this charset
-    first_state = create_state(name="%s-first" % name)
-    last_state = create_state(name="%s-last" % name)
+    first_state = create_state(name="%s" % name)
+    last_state = create_state(name="@%s#last" % name)
     nfa = create_nfa(first_state, last_state)
     state = create_state("%s" % name)
 
@@ -403,8 +385,8 @@ def build_charset_nfa(name, charset, negated):
 
 def build_recursive_nfa(name, sub_nfa):
     # Link first to last and last to first
-    first_state = create_state(name="%s-recursive-first" % name)
-    last_state = create_state(name="%s-recursive-last" % name)
+    first_state = create_state(name="@%s-recursive#first" % name)
+    last_state = create_state(name="@%s-recursive#last" % name)
     nfa = create_nfa(first_state, last_state)
     
     # Link the incoming nfa to the new first and last states
@@ -418,17 +400,30 @@ def build_recursive_nfa(name, sub_nfa):
     return nfa
 
 
-def build_concatenation_nfa(nfas):
+def build_concatenation_nfa(name, nfas):
+    if (len(nfas) == 1):
+        return nfas[0]
+
+    # Link first to last and last to first
+    first_state = create_state(name="@%s#concatenation-first" % name)
+    last_state = create_state(name="@%s#concatenation-last" % name)
+    nfa = create_nfa(first_state, last_state)
+
     for i, sub_nfa in enumerate(nfas[:-1]):
         sub_nfa.last.transitions.append(create_transition(nfas[i+1].first))
 
-    return create_nfa(nfas[0].first, nfas[-1].last)
+    # Link first to first 
+    first_state.transitions.append(create_transition(nfas[0].first))
+    # Link last to last
+    nfas[-1].last.transitions.append(create_transition(last_state))
+
+    return nfa
 
 
 def build_union_nfa(name, nfas):
     # Create first and last dummy states and the nfa for this string
-    first_state = create_state(name="%s-union-first" % name)
-    last_state = create_state(name="%s-union-last" % name)
+    first_state = create_state(name="@%s#union-first" % name)
+    last_state = create_state(name="@%s#union-last" % name)
     nfa = create_nfa(first_state, last_state)
 
     for sub_nfa in nfas:
@@ -555,9 +550,21 @@ def nfa_to_dfa(first_state):
     first_lambda_closure = lookup_or_find_lambda_closure(lambda_closures, first_state)
 
     # Set a new DFA state as the closure of the NFA state
+    # XXX Pick the appropriate name:
+    # - If the closure has a final state, use the name of that final state
+    # - Otherwise avoid picking a fake node (starting with @) if possible
+    final_state_node_names = [_.name for _ in first_lambda_closure if _.final ]
+    non_fake_node_names = [_.name for _ in first_lambda_closure if not(_.name.startswith("@"))]
+    if (is_empty(final_state_node_names)):
+        if (is_empty(non_fake_node_names)):
+            dfa_state_name = first_lambda_closure[0].name
+        else:
+            dfa_state_name = non_fake_node_names[0]
+    else:
+        # XXX Should this pick the non fake if several exist?
+        dfa_state_name = final_state_node_names[0]
     dfa_state =  create_state(
-        # XXX Pick another way of naming the state?
-        first_lambda_closure[0].name,
+        dfa_state_name,
         # Final if any state in the lambda closure is final
         # XXX This should calculate whether the closure is final when generating
         #     it rather than after the fact
@@ -739,20 +746,49 @@ def build_dot(first_states):
     l.append("}")
     return string.join(l, "\n")
 
+def create_nfa_builder(symbols, terminal_symbols):
+    return Struct(nfa_stack = dict(), symbols = symbols, terminal_symbols = terminal_symbols)
 
-def build_nfa(symbols, terminal_symbols, symbol_name):
+def build_nfa(nfa_builder, symbol_name):
+    # XXX This works for lexical grammars, but the phrase structure grammar has
+    #     a lot of recursion which causes combinatory explosion when inlining
+    #     the eNFAs, since every path ends up inlining the ~50 NFAs of the
+    #     grammar
+    #     It needs some way of referring to smaller eNFAs by reference rather
+    #     than reworking and inlining the smaller eNFA all over again. 
+    #     Unfortunately it's not clear how using those eNFAs by reference can be
+    #     preserved when doing eNFA->NFA or eNFA->DFA conversions, maybe some
+    #     kind of closure can be obtained from the NFA by ref?
 
     assert None is dbg("build_nfa", symbol_name)
+
+    symbols = nfa_builder.symbols
+    terminal_symbols = nfa_builder.terminal_symbols
+    nfa_stack = nfa_builder.nfa_stack
+
+    print "stack depth", len( nfa_stack.keys())
+    if (symbol_name in nfa_stack):
+        return nfa_stack[symbol_name]
 
     symbol = symbols[symbol_name]
 
     if (symbol.one_of or symbol.none_of):
-        # if all are single chars can use charset nodes, otherwise need to use
-        # string nodes
-        # one of and none of rules only have one symbol rule per rule
+        # "one of" and "none of" rules only have one symbol rule per rule, the
+        # symbol is a string or a charset
+        
         assert all([len(rule) == 1 for rule in symbol.rules])
         ones = [rule[0].symbol for rule in symbol.rules]
         assert all([one in terminal_symbols for one in ones])
+        
+        # XXX Grammars are normally good in using "one of" and "none of" rules
+        #     but it's possible they should use them and they don't, have the 
+        #     grammar parser catch that case and convert into "one of"/"none of"?
+        
+        # XXX This assumes "one of" and "none of" are used only on terminal
+        #     symbols, probably the grammar parser should check that
+
+        # if all are single chars can use charset nodes, otherwise need to use
+        # string nodes
         if (max([len(one) for one in ones]) == 1):
             nfa = build_charset_nfa(symbol.name, ones, symbol.none_of)
 
@@ -763,101 +799,189 @@ def build_nfa(symbols, terminal_symbols, symbol_name):
 
             nfa = build_union_nfa(symbol.name, nfas)
 
-    else:
-        recursive_nfas = []
-        opt_recursive_nfas = []
-        union_nfas = []
+        # These don't need to update the stack since they are terminal
 
-        has_left_recursion = False
-        has_right_recursion = False
+    else:
+        # Create the first and last states even if they are dummy and push the
+        # nfa to the the stack early, this allows handling the rules much more
+        # easily (especially in the presence of direct and indirect recursion)
+        # at the expense of a less compact NFA (but it can be compacted later
+        # either by removing lambda transitions or converting to DFA)
+        first_state = create_state(name="%s" % symbol_name)
+        last_state = create_state(name="@%s#last" % symbol_name)
+        nfa = create_nfa(first_state, last_state)
+        nfa_stack[symbol_name] = nfa
+
+        union_nfas = []
         for rule in symbol.rules:
             concatenation_nfas = []
-            recursive_rule = False
-            opt_recursive_rule = False
             for rule_symbol in rule:
 
-                if (rule_symbol.symbol == symbol_name):
-                    # recursion
-                    # XXX Not supported:
-                    #     - middle recursion
-                    #     - multiple recursion in the same rule
-                    #     - mixed left and right recursion across rules of the same symbol
-                    assert(not recursive_rule)
-                    recursive_rule = True
-                    opt_recursive_rule = rule_symbol.opt
-                    if (rule[0].symbol == symbol_name):
-                        # Don't support mixing left and right recursion in the
-                        # same symbol
-                        assert(not has_right_recursion)
-                        has_left_recursion = True
-
-                    elif (rule[-1].symbol == symbol_name):
-                        # Don't support mixing left and right recursion in the
-                        # same symbol
-                        assert(not has_left_recursion)
-                        has_right_recursion = True
-
-                    else:
-                        # Middle recursion, not supported
-                        assert False
-                
+                if (rule_symbol.symbol in terminal_symbols):
+                    concatenation_nfa = build_string_nfa(rule_symbol.symbol)
+                    
                 else:
-                    if (rule_symbol.symbol in terminal_symbols):
-                        nfa = build_string_nfa(rule_symbol.symbol)
-                        
-                    else:
-                        nfa = build_nfa(symbols, terminal_symbols, rule_symbol.symbol)
-
-                    if (rule_symbol.opt):
-                        nfa = build_optional_nfa(nfa)
-                
-                    concatenation_nfas.append(nfa)
+                    concatenation_nfa = build_nfa(nfa_builder, rule_symbol.symbol)
+                    
+                if (rule_symbol.opt):
+                    concatenation_nfa = build_optional_nfa(concatenation_nfa)
+            
+                concatenation_nfas.append(concatenation_nfa)
                 
             # Don't support empty rules
+            # XXX Check this at the grammar parsing level?
             assert(not is_empty(concatenation_nfas))
-            nfa = build_concatenation_nfa(concatenation_nfas)
+            union_nfa = build_concatenation_nfa(symbol.name, concatenation_nfas)
 
-            if (recursive_rule):
-                if (opt_recursive_rule):
-                    opt_recursive_nfas.append(nfa)
-                else:
-                    recursive_nfas.append(nfa)
-            else:
-                union_nfas.append(nfa)
+            union_nfas.append(union_nfa)
 
-        nfa = build_union_nfa(symbol.name, union_nfas)
-        if (not is_empty(recursive_nfas) or not is_empty(opt_recursive_nfas)):
-            # right recursion     left recursion    opt right rec   mixed opt
-            # A:                  A:                A:              A:
-            #   a                   a                 a               a
-            #   b                   b                 b               b
-            #   c A                 A c               c A opt         c A
-            #   d A                 A d               d A opt         d A opt
-            # (c|d)*(a|b)         (a|b)(c|d)*       (c|d)*(a|b)?    c*(a|b|d)|d*(a|b|d)?
-            
-            # XXX This should actually be done by creating the necessary
-            #     transitions which is a lot simpler and more powerful than
-            #     trying to generate the regexp and work out the NFA from there
-
-            # 
-            # XXX Mixing opt and non-opt requires a deep copy of the union nfa,
-            #     not supported by now
-            assert(is_empty(recursive_nfas) or is_empty(opt_recursive_nfas))
-            if (not is_empty(recursive_nfas)):
-                recursive_nfa = build_recursive_nfa(symbol.name, build_union_nfa(symbol.name, recursive_nfas))
-            
-            elif (not is_empty(opt_recursive_nfas)):
-                recursive_nfa = build_recursive_nfa(symbol.name, build_union_nfa(symbol.name, opt_recursive_nfas))
-                nfa = build_optional_nfa(nfa)
-            
-            if (has_left_recursion):
-                nfa = build_concatenation_nfa([nfa] + [recursive_nfa])
-
-            else:
-                assert(has_right_recursion)
-                nfa = build_concatenation_nfa([recursive_nfa] + [nfa])
+        all_nfa = build_union_nfa(symbol.name, union_nfas)
+        
+        # Hook to first and last
+        nfa.first.transitions.append(create_transition(all_nfa.first))
+        all_nfa.last.transitions.append(create_transition(nfa.last))
                 
+        # del nfa_stack[symbol_name]
     return nfa
+
+def build_checkable_grammar(symbols, terminal_symbols, start_symbol):
+    """
+    Build a grammar that can be checked at http://smlweb.cpsc.ucalgary.ca/start.html
+    Following the format at http://smlweb.cpsc.ucalgary.ca/readme.html
+        head -> RHS1
+        | RHS2
+        ....
+        | RHSn.
+    """
+    long_to_short = {}
+    def escape_checkable(s):
+        if s not in long_to_short:
+            if (s[0].isupper()):
+                long_to_short[s] = "%s%03d" % (s[:3], len(long_to_short))
+            else:
+                long_to_short[s] = "a%03d" % len(long_to_short)
+        s = long_to_short[s]
+        return s
+
+    def escape_non_terminal(s):
+        # Non-terminal uppercase
+        return escape_checkable(s.upper())
+
+    def escape_terminal(s):
+        # Terminal go in lowercase
+        return escape_checkable(s.lower())
+
+    l = []
+    for symbol_name, symbol in symbols.items():
+        # symbols separated by "\n"
+        for i, rule in enumerate(symbol.rules):
+            ll = []
+            # rules in a symbol by "|" or -> if it's the first rule
+            if (i == 0):
+                ll.append("%s -> " % escape_non_terminal(symbol_name))
+            else:
+                ll.append("  | ")
+            
+            for rule_symbol in rule:
+                # rule symbols by " "
+                if (rule_symbol.symbol in terminal_symbols):
+                    s = escape_terminal(rule_symbol.symbol)
+                
+                else:
+                    s = escape_non_terminal(rule_symbol.symbol)
+                ll.append(s)
+
+            if (i == (len(symbol.rules) - 1)):
+                ll.append(".")
+
+            l.append(string.join(ll, " "))
+            
+
+    l.append("S -> %s." % escape_non_terminal(start_symbol))  
+    
+    grammar = string.join(l, "\n")
+
+    return grammar
+
+
+def build_lark_grammar(symbols, terminal_symbols, start_symbol):
+    """
+    Return the grammar in Lark format, rules in lowercase, terminals in
+    uppercase.
+
+    Rule prefixes like ! and ? can be used to affect the tree generation
+    (removing intermediate nodes, tokens, etc), but are not necessary just for
+    parsing itself
+
+    see https://lark-parser.readthedocs.io/en/latest/grammar.html
+    see https://lark-parser.github.io/ide/#
+
+        start: value
+
+        value: object
+            | array
+            | string
+            | SIGNED_NUMBER
+            | "true"
+            | "false"
+            | "null"
+
+        array  : "[" [value ("," value)*] "]"
+        object : "{" [pair ("," pair)*] "}"
+        pair   : string ":" value
+
+        WHITESPACE: (" " | /\t/ | /\n/ )+
+
+        %ignore WHITESPACE
+    """
+    long_to_short = {}
+    def escape_lark(s):
+        return s
+
+    def escape_non_terminal(s):
+        # Non-terminal lowercase
+        return escape_lark(s.lower().replace("-", "_"))
+
+    def escape_terminal(s):
+        # Terminal uppercase or in quotation marks
+        return '"%s"' % escape_lark(s).encode("string_escape").replace('"', '\\"')
+
+    l = []
+    for symbol_name, symbol in symbols.items():
+        # symbols separated by "\n"
+        for i, rule in enumerate(symbol.rules):
+            ll = []
+            # rules in a symbol separated by "|" or : if it's the first rule
+            if (i == 0):
+                ll.append("%s: " % escape_non_terminal(symbol_name))
+            else:
+                ll.append("  | ")
+            
+            for rule_symbol in rule:
+                # rule symbols separated by " "
+                if (rule_symbol.symbol in terminal_symbols):
+                    s = escape_terminal(rule_symbol.symbol)
+                
+                else:
+                    s = escape_non_terminal(rule_symbol.symbol)
+                if (rule_symbol.opt):
+                    s = s + "?"
+                ll.append(s)
+
+            l.append(string.join(ll, " "))
+            
+
+    # Add a few generic rules/terminals/directives
+    l.append("start: %s" % escape_non_terminal(start_symbol))
+    # XXX These should be taken from the scanner?
+    l.extend([
+        r"WHITESPACE: (/ / | /\t/ | /\n/ | /\r/ )+", 
+        "%ignore WHITESPACE"
+    ])
+    
+    grammar = string.join(l, "\n")
+
+    return grammar
 
 
 def build_test_nfa(symbols, terminal_symbols):
@@ -867,6 +991,7 @@ def build_test_nfa(symbols, terminal_symbols):
         sub_nfas.append(sub_nfa)
 
     sub_nfa = build_concatenation_nfa(
+        "test",
         [   
             build_string_nfa("s"), 
             build_recursive_nfa(build_string_nfa("tar"))
@@ -1193,42 +1318,279 @@ def scan_dfa(first_state, filepath):
         print "char cache hits", scanner.cache_hits, "char cache misses", scanner.cache_misses
 
 
-def main():
-    with open("grammars/c99_lexical_grammar.txt", "r") as f:
-        c99_lexical_grammar = f.read().splitlines()
-    scanner_symbols = parse_grammar(c99_lexical_grammar)
-    
-    if (True):
-        with open("grammars/c99_phrase_structure_grammar.txt", "r") as f:
-            c99_phrase_structure_grammar = f.read().splitlines()
-        parser_symbols = parse_grammar(c99_phrase_structure_grammar)
-     
-    assert None is dbg(scanner_symbols)
+
+def find_terminal_symbols(symbols):
     print "terminal symbols"
-    scanner_terminal_symbols = set()
-    for symbol_name, symbol in scanner_symbols.items():
+    
+    terminal_symbols = set()
+    for symbol_name, symbol in symbols.items():
         for rule in symbol.rules:
             for rule_symbol in rule:
-                if rule_symbol.symbol not in scanner_symbols:
-                    scanner_terminal_symbols.add(rule_symbol.symbol)
-    assert None is dbg(scanner_terminal_symbols)
+                if (rule_symbol.symbol not in symbols):
+                    terminal_symbols.add(rule_symbol.symbol)
+    assert None is dbg(terminal_symbols)
 
-    #dbg(build_regexp(scanner_symbols, scanner_terminal_symbols, "block-comment"))
-    # grammar_regexp =  build_regexp(scanner_symbols, scanner_terminal_symbols, "token")
+    return terminal_symbols
+
+
+def parse_top_down(symbols, start_symbol, program_tokens):
+    def create_stack_entry(symbol_name, rule_index, rule_symbol_index, rule_symbol_sub_index, token_index):
+        return Struct(
+            symbol_name=symbol_name, rule_index=rule_index, 
+            rule_symbol_index=rule_symbol_index, rule_symbol_sub_index=rule_symbol_sub_index,
+            token_index=token_index
+        )
     
-    # Using regexp directly has two problems:
+    def is_terminal(symbol):
+        return symbol not in symbols
+
+    def rule_str(symbol, rule_index, rule_symbol_index = 0):
+        return "%s[%d] : %s" % (
+            symbol.name, 
+            rule_index,
+            string.join(
+                [rule_symbol.symbol for rule_symbol in symbol.rules[rule_index][:rule_symbol_index]] +
+                ["^"] +
+                [rule_symbol.symbol for rule_symbol in symbol.rules[rule_index][rule_symbol_index:]],
+                " "
+            )
+        )
+
+    def parse_symbol(parser, symbol):
+        """
+        Return false if the symbol failed to be parsed
+
+
+        Issues with top down parsers:
+        - When memoizing you need to use the token index and the full recursive
+          symbol stack as key, using the token index and the failed symbol is
+          not enough, eg
+
+            type-name: ID 
+            type-qual: ID 
+            identifier: ID 
+            parameter: type-name identifier
+            parameter: type-name type-qual identifier
+            parameters: parameter
+            parameters: parameter , parameters
+            
+          Looks like this is what it's called "non-deterministic grammar" and
+          is not supposed to be handled by packrat
+          This can be solved by doing both of
+          - enlarging the memoing key to contain all the 
+          symbols in the descent path and not just the final symbol
+          - not memoing successes, only failures
+
+        - Left recursivity 
+            A: Aa
+               a
+            A: Ba
+               a
+            B: Ab
+            This can either be transformed to right recursivity with lambda
+            (but probably won't work with indirect recursion unless all the rules
+            in the grammar are changed to start with a terminal? 
+            changing to right recursivity will also break left associativity
+            in the grammar)
+            or the call can succeed until the accepted token string doesn't grow anymore
+            
+            Note at least in the direct case there must be another rule for
+            that symbol that is not recursive or the rule would never end, so 
+            when it fails there's always one rule that can take over the failure
+            in that same symbol without having to backtrack.
+            
+            XXX Left recursivity support is not implemented yet, probably needs
+                something like described above where a recursive rule is let to
+                recurse with iteratively increasing recursion depths, until there's 
+                no progress reading the token string.
+                
+                This requires failing the recursion at some point (so the other 
+                non-recursive rules in this symbol are tried and the token string
+                advanced), but also being able to make the recursion not fail 
+                once the max depth is increased again. It's possible the failure 
+                key will need to be enlarged to store the current max recursion 
+                level too
+        """
+        
+        print "parsing token[%d]" % parser.token_index, parser.tokens[parser.token_index], "depth", parser.depth, "stack", parser.stack, "+", symbol.name
+        ## print "success stack", parser.success_stack
+
+        assert len(parser.success_stack) == parser.token_index
+
+        max_parser_depth = 20
+        if (parser.depth >= max_parser_depth):
+            print "depth overflow"
+            # Record the failure
+            parser.failures.add(key)
+            return False
+
+        original_token_index = parser.token_index
+        rule_index = 0
+        while (rule_index < len(symbol.rules)):
+            rule = symbol.rules[rule_index]
+
+            parser.depth += 1
+            parser.stack.append( (symbol.name, rule_index) )
+
+            # At least one rule must succeed to parse
+            res = True
+            rule_failed = False
+            key = (parser.token_index, tuple(parser.stack), rule_index)
+            if (key in parser.failures):
+                print "failing previous failure for rule", rule_str(symbol, rule_index), "with token[%d]" % parser.token_index, parser.tokens[parser.token_index]
+                res = False
+                rule_failed = True
+                rule_symbol = rule[0]
+            
+            rule_symbol_index = 0
+            while not rule_failed and (rule_symbol_index < len(rule)):
+                
+                rule_symbol = rule[rule_symbol_index]
+                print "parsing token[%d]" % parser.token_index, parser.tokens[parser.token_index], "for rule", rule_str(symbol, rule_index, rule_symbol_index)
+
+                # All the rule symbols must succeed to parse
+                rule_symbol_token_index = parser.token_index
+                if (is_terminal(rule_symbol.symbol)):
+                    res = (parser.tokens[parser.token_index] == rule_symbol.symbol)
+                    if (res):
+                        assert (len(parser.success_stack) == parser.token_index)
+                        # Store the success information in case it needs to be redone
+                        success_stack_entry = Struct(
+                            token_index=parser.token_index,
+                            key=key, 
+                            rule_index=rule_index, 
+                            rule_symbol_index=rule_symbol_index,
+                            symbol = symbol.name,
+                        )
+                        parser.success_stack.append(success_stack_entry)
+                        # Advance the token, go to the next symbol in this rule
+                        parser.token_index += 1
+                        if (parser.token_index == len(parser.tokens)):
+                            # XXX This can probably be simplified since it's
+                            #     always the last terminal of the start rule
+                            print "Parsed full tokens!!!"
+                            return True
+                            
+                else:
+                    
+                    res = parse_symbol(parser, symbols[rule_symbol.symbol])
+
+                    if (parser.token_index == len(parser.tokens)):
+                        return True
+
+                if (not res):
+                    if (rule_symbol.opt):
+                        # Failing on optional rule_symbols is ok, just restore
+                        # the token to the previous symbol and continue
+                        
+                        # XXX What if this optional has a rule that was tagged
+                        #     as failure for a given token index because of
+                        #     something this optional did?
+                        parser.token_index = rule_symbol_token_index
+                        if (parser.token_index != len(parser.success_stack)):
+                            print "popping success entries", parser.success_stack[parser.token_index:]
+                            del parser.success_stack[parser.token_index:]
+                            assert (parser.token_index == len(parser.success_stack))
+
+                        # Tag as success in case this optional symbol is the
+                        # last one in the rule
+                        res = True
+                        
+                    else:
+                        # Go to the next rule, token will be restored below if
+                        # needed
+                        break
+
+                rule_symbol_index += 1
+
+            if (res):
+                # One rule succeeded, return to the parent with the updated
+                # token
+                print "token[%d]" % (parser.token_index-1), repr(parser.tokens[parser.token_index-1]), "succeeded on rule", rule_str(symbol, rule_index, rule_symbol_index)
+                parser.stack.pop()
+                parser.depth -= 1
+                break
+
+            else:
+                # Note we may not have a rule_symbol if the rule failed early, 
+                print "token[%d]" % parser.token_index, repr(parser.tokens[parser.token_index]), "failed on rule", rule_str(symbol, rule_index, rule_symbol_index)
+
+                # Restore the parser token, try the next rule
+                parser.token_index = original_token_index
+
+                # Update the success stack
+                if (parser.token_index != len(parser.success_stack)):
+                    print "popping success entries", parser.success_stack
+                    # Tag the last success as failure so it gets retried, pop
+                    # the other successes but don't tag them as failure as the
+                    # last success may have other rules that may still set the
+                    # other as successes
+                    success_stack_entry = parser.success_stack[-1]
+                    assert len(parser.success_stack)-1 == success_stack_entry.token_index
+                    success_key = success_stack_entry.key
+                    parser.failures.add(success_key)
+                    del parser.success_stack[parser.token_index:]
+                    assert (parser.token_index == len(parser.success_stack))    
+                    # Force to retry this rule 
+                    rule_index -= 1
+
+            rule_index += 1
+
+            parser.stack.pop()
+            parser.depth -= 1
+
+        if (not res):
+            # record the failure if not already
+            parser.failures.add(key)
+        
+        return res
+
+
+    # Create a dummy start symbol with the EOF token
+    # XXX Have a way of guaranteeing start, maybe by checking the symbol is not 
+    #     there
+
+    start_symbol = Struct(name="@start", one_of=False, none_of=False, rules=[
+        [Struct(symbol=start_symbol, opt=False), Struct(symbol="", opt=False)]
+    ])
+    # XXX This still doesn't guarantee it doesn't collide with a terminal
+    assert(start_symbol.name not in symbols)
+    # Add the EOF token to the program
+    # XXX Do this in some other way that doesn't require access to the full tokens
+    program_tokens.append("")
+    parser = Struct(
+        tokens=program_tokens, token_index=0, 
+        depth=0, stack=[], failures=set(), success_stack=[]
+    )
+    
+    res = parse_symbol(parser, start_symbol)
+
+    return res
+    
+
+def test_dfa_scanner(scanner_grammar_filepath, source_filepath, start_symbol):
+    # Using regexp for a scanner instead of a NFA/DFA has two problems:
     # - in the Python re module there's no incremental matching, you have to
     #   pass the whole string to re and find a match. Other options would be to
     #   convert the regexp to one that accepts partial matches
     # - in the Python re module and most other regexp engines, the longest match
     #   is guaranteed in the presence of star (unless non-greedy is used), but
-    #   not in the face of alternative regexps, eg analyzing 1.2 would yield a
-    #   match for 1 as an integer constant instead of a longer mach of 1.2 as a
-    #   floating point constant
+    #   not in the presence of alternative regexps, eg analyzing 1.2 would yield
+    #   a match for 1 as an integer constant instead of a longer mach of 1.2 as
+    #   a floating point constant
     
-    nfa = build_nfa(scanner_symbols, scanner_terminal_symbols, "token")
-    #nfa = build_nfa(scanner_symbols, scanner_terminal_symbols, "translation-unit")
+    with open(scanner_grammar_filepath, "r") as f:
+        scanner_grammar = f.read().splitlines()
+        scanner_symbols = parse_grammar(scanner_grammar)
+
+    scanner_terminal_symbols = find_terminal_symbols(scanner_symbols)
+
+
+    nfa_builder = create_nfa_builder(scanner_symbols, scanner_terminal_symbols)
+    nfa = build_nfa(nfa_builder, start_symbol)
+    # Assume the last state is the final one
     nfa.last.final = True
+
     generate_dot = True
     if (generate_dot):
         dot = build_dot([nfa.first])
@@ -1243,14 +1605,16 @@ def main():
             f.write(dot)
     print_nfa_stats([dfa])
 
-    first_states = remove_lambda_transitions(nfa)
-    if (generate_dot):
-        dot = build_dot(first_states)
-        with open("_out/after.dot", "w") as f:
-            f.write(dot)
-    print_nfa_stats(first_states)
-    
-    
+    # Disable removing lambda transitions since it takes a very long time and 
+    # it's not necessary once we can convert from nfa to dfa
+    if (False):
+        first_states = remove_lambda_transitions(nfa)
+        if (generate_dot):
+            dot = build_dot(first_states)
+            with open("_out/after.dot", "w") as f:
+                f.write(dot)
+        print_nfa_stats(first_states)
+
     do_perf = False
     if (do_perf):
         import timeit
@@ -1264,9 +1628,107 @@ def main():
         t = timeit.Timer(lambda: scan_nfa(first_states, "_out/pngvalid.c"), setup='print("nfa")')
         print(t.timeit(5))
 
-    else:
-        scan_dfa(dfa, "_out/pngvalid.c")
+    scan_dfa(dfa, source_filepath)
 
+
+def test_topdown_parser(parser_grammar_filepath, program_tokens, start_symbol):
+    with open(parser_grammar_filepath, "r") as f:
+        parser_grammar = f.read().splitlines()
+    parser_symbols = parse_grammar(parser_grammar)
+    parser_terminal_symbols = find_terminal_symbols(parser_symbols)
+
+    s = build_checkable_grammar(parser_symbols, parser_terminal_symbols, start_symbol)
+    with open("_out/grammar.check", "w") as f:
+        f.write(s)
+
+    s = build_lark_grammar(parser_symbols, parser_terminal_symbols, start_symbol)
+    with open("_out/grammar.lark", "w") as f:
+        f.write(s)
+    
+    # Checkable says the c99 phrase structure grammar as in the spec it's not
+    # LL(1), it's also ambiguous because of the "lexer hack" needed where the
+    # lexer needs to look into semantic to tell between "t * x;" being a pointer
+    # declaration o an expression
+
+    parse_top_down(parser_symbols, start_symbol, program_tokens)
+
+
+def test_regexp_scanner(scanner_symbols, ):
+    with open(grammar_filepath, "r") as f:
+        c99_lexical_grammar = f.read().splitlines()
+        scanner_symbols = parse_grammar(c99_lexical_grammar)
+
+    dbg(build_regexp(scanner_symbols, scanner_terminal_symbols, "block-comment"))
+    grammar_regexp =  build_regexp(scanner_symbols, scanner_terminal_symbols, "token")
+
+
+def main():
+
+    test_dfa = False
+    if (test_dfa):
+        # Scanning the c99 lexical grammar using dfa works
+        scanner_grammar_filepath = "grammars/c99_lexical_grammar.txt"
+        source_filepath = "_out/simple.c"
+        test_dfa_scanner(scanner_grammar_filepath, source_filepath, "token")
+
+    test_topdown = True
+    if (test_topdown):
+        # Tests without the need of a tokenizer since the sample program
+        # uses tokens directly
+
+        # XXX C99 grammar doesn't work with top down parser because of left
+        #   recursion
+        grammar_filepath = "grammars/c99_phrase_structure_grammar.txt"
+        sample_program_tokens = (
+            "translation-unit",
+            [
+            "int",      # int main(int argc, char* argv[])
+            "identifier",
+            "(",
+            "int",
+            "identifier",
+            ",",
+            "char",
+            "*",
+            "identifier",
+            "[",
+            "]",
+            ")",
+            
+            "{",
+
+            "int",        # int a = 1.0 + 1.2f;
+            "identifier",
+            "=",
+            "constant",
+            "+",
+            "constant",
+            ";",
+
+            "return",    # return a;
+            "a",
+            ";",
+
+            "}",
+            ]
+        )
+
+        # Sample grammar to test specific cases
+        grammar_filepath = "tests/test_grammar.txt"
+        # Right recursive works
+        sample_program_tokens = ("right-recursive", ["gh","gh","gh","gh","gh","gh","gh","gh","ef"])
+        # Indirect right recursive works
+        sample_program_tokens = ("indirect-right-recursive", ["st", "wx", "st", "wx", "qr"])
+        # Function parameters using right recursion works
+        sample_program_tokens = ("function", ["ID", "ID", "(", "ID", "ID", ",", "ID", "ID", ")"])
+        # XXX Left recursive doesn't work 
+        sample_program_tokens = ("left-recursive", ["ab","cd","cd","cd","cd","cd","cd"])
+        # XXX Indirect left recursive doesn't work
+        sample_program_tokens = ("indirect-left-recursive", ["ij","op","kl","op","kl","op","kl"])
+        # Tagging a success as a failure works
+        sample_program_tokens = ("backtrack-success", ["ID", "ID" ])
+
+        test_topdown_parser(grammar_filepath, sample_program_tokens[1], sample_program_tokens[0])
 
                 
 if (__name__ == "__main__"):

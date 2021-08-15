@@ -1,0 +1,30 @@
+# left-recursive
+# ab(cd)*
+ab
+abcd
+abcdcd
+abcdcdcd
+
+# indirect-right-recursive
+# qr|stuv|stwxqr|stwxstuv|stwxstwxqr
+qr
+stuv
+stwxqr
+stwxstuv
+stwxstwxqr
+
+# indirect-left-recursive
+# ij|(mn|(ij|(mn|(ij|(mn|(ij()kl)op)kl)op)kl)op)kl
+ij
+mnkl
+ijopkl
+mnklopkl
+ijopklopkl
+mnklopklopkl
+ijopklopklopkl
+
+#() right-recursive:
+# (gh)*ef
+ghghghghghghghghef
+
+# function
