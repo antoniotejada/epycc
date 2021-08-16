@@ -1,3 +1,8 @@
+// LALR(1) standalone parsers can be generated via
+//   python -m lark.tools.standalone _out\c99_phrase_structure_grammar.lark
+// but note this grammar has reduction-reduction conflicts (typedef-name vs. 
+// identifier) and will fail to generate the standalone parser, so an Earley 
+// parser is used instead
 direct_abstract_declarator:  "(" abstract_declarator ")"
   |  direct_abstract_declarator? "[" assignment_expression? "]"
   |  direct_abstract_declarator? "[" "*" "]"
@@ -5,17 +10,17 @@ direct_abstract_declarator:  "(" abstract_declarator ")"
 postfix_expression:  primary_expression
   |  postfix_expression "[" expression "]"
   |  postfix_expression "(" argument_expression_list? ")"
-  |  postfix_expression "." "identifier"
-  |  postfix_expression "->" "identifier"
+  |  postfix_expression "." identifier
+  |  postfix_expression "->" identifier
   |  postfix_expression "++"
   |  postfix_expression "--"
   |  "(" type_name ")" "{" initializer_list "}"
   |  "(" type_name ")" "{" initializer_list "," "}"
 abstract_declarator:  pointer
   |  pointer? direct_abstract_declarator
-enum_specifier:  "enum" "identifier"? "{" enumerator_list "}"
-  |  "enum" "identifier"? "{" enumerator_list "," "}"
-  |  "enum" "identifier"
+enum_specifier:  "enum" identifier? "{" enumerator_list "}"
+  |  "enum" identifier? "{" enumerator_list "," "}"
+  |  "enum" identifier
 initializer:  assignment_expression
   |  "{" initializer_list "}"
   |  "{" initializer_list "," "}"
@@ -49,15 +54,15 @@ storage_class_specifier:  "typedef"
   |  "register"
 struct_declaration_list:  struct_declaration
   |  struct_declaration_list struct_declaration
-struct_or_union_specifier:  struct_or_union "identifier"? "{" struct_declaration_list "}"
-  |  struct_or_union "identifier"
+struct_or_union_specifier:  struct_or_union identifier? "{" struct_declaration_list "}"
+  |  struct_or_union identifier
 additive_expression:  multiplicative_expression
   |  additive_expression "+" multiplicative_expression
   |  additive_expression "-" multiplicative_expression
 pointer:  "*" type_qualifier_list?
   |  "*" type_qualifier_list? pointer
 function_definition:  declaration_specifiers declarator declaration_list? compound_statement
-direct_declarator:  "identifier"
+direct_declarator:  identifier
   |  "(" declarator ")"
   |  direct_declarator "[" type_qualifier_list? assignment_expression? "]"
   |  direct_declarator "[" "static" type_qualifier_list? assignment_expression "]"
@@ -65,7 +70,9 @@ direct_declarator:  "identifier"
   |  direct_declarator "[" type_qualifier_list? "*" "]"
   |  direct_declarator "(" parameter_type_list ")"
   |  direct_declarator "(" identifier_list? ")"
-typedef_name:  "identifier"
+// XXX typedef_name gives reduction reduction conflicts, needs fixing for LALR(1) 
+//     parser but it's okay for Earley parser
+typedef_name: identifier
 declaration_specifiers:  storage_class_specifier declaration_specifiers?
   |  type_specifier declaration_specifiers?
   |  type_qualifier declaration_specifiers?
@@ -80,14 +87,14 @@ unary_expression:  postfix_expression
   |  unary_operator cast_expression
   |  "sizeof" unary_expression
   |  "sizeof" "(" type_name ")"
-identifier_list:  "identifier"
-  |  identifier_list "," "identifier"
+identifier_list:  identifier
+  |  identifier_list "," identifier
 logical_and_expression:  inclusive_or_expression
   |  logical_and_expression "&&" inclusive_or_expression
 parameter_type_list:  parameter_list
   |  parameter_list "," "..."
-enumerator:  "enumeration-constant"
-  |  "enumeration-constant" "=" constant_expression
+enumerator:  enumeration_constant
+  |  enumeration_constant "=" constant_expression
 parameter_list:  parameter_declaration
   |  parameter_list "," parameter_declaration
 block_item_list:  block_item
@@ -104,7 +111,7 @@ type_qualifier:  "const"
   |  "restrict"
   |  "volatile"
 designator:  "[" constant_expression "]"
-  |  "." "identifier"
+  |  "." identifier
 struct_declaration:  specifier_qualifier_list struct_declarator_list ";"
 assignment_expression:  conditional_expression
   |  unary_expression assignment_operator assignment_expression
@@ -125,7 +132,7 @@ selection_statement:  "if" "(" expression ")" statement
   |  "switch" "(" expression ")" statement
 type_qualifier_list:  type_qualifier
   |  type_qualifier_list type_qualifier
-labeled_statement:  "identifier" ":" statement
+labeled_statement:  identifier ":" statement
   |  "case" constant_expression ":" statement
   |  "default" ":" statement
 type_name:  specifier_qualifier_list abstract_declarator?
@@ -164,7 +171,7 @@ multiplicative_expression:  cast_expression
   |  multiplicative_expression "/" cast_expression
   |  multiplicative_expression "%" cast_expression
 constant_expression:  conditional_expression
-jump_statement:  "goto" "identifier" ";"
+jump_statement:  "goto" identifier ";"
   |  "continue" ";"
   |  "break" ";"
   |  "return" expression? ";"
@@ -175,9 +182,9 @@ parameter_declaration:  declaration_specifiers declarator
 inclusive_or_expression:  exclusive_or_expression
   |  inclusive_or_expression "|" exclusive_or_expression
 function_specifier:  "inline"
-primary_expression:  "identifier"
-  |  "constant"
-  |  "string-literal"
+primary_expression:  identifier
+  |  constant
+  |  string_literal
   |  "(" expression ")"
 type_specifier:  "void"
   |  "char"
@@ -198,6 +205,67 @@ expression:  assignment_expression
   |  expression "," assignment_expression
 external_declaration:  function_definition
   |  declaration
+
+// Start
 start: translation_unit
-WHITESPACE: (/ / | /\t/ | /\n/ | /\r/ )+
-%ignore WHITESPACE
+
+// Lexer terminals
+identifier: IDENTIFIER
+
+string_literal: ESCAPED_STRING
+
+constant: integer_constant
+  |  floating_constant
+  |  enumeration_constant
+  |  character_constant
+
+integer_constant: INT_SUFFIXED
+
+floating_constant: FLOAT_SUFFIXED
+
+enumeration_constant: identifier
+
+character_constant: "'" c_char_sequence "'"
+  | "L'" c_char_sequence "'"
+
+c_char_sequence: c_char
+  | c_char_sequence c_char
+
+c_char: c_char_set
+  | escape_sequence
+
+c_char_set: /[^\n\\']/
+
+escape_sequence: simple_escape_sequence
+  // XXX Needs adding all the escape cases, encodings, etc
+  // octal-escape-sequence
+  // hexadecimal-escape-sequence
+  // universal-character-name
+
+simple_escape_sequence: "\\'" | "\\\"" | "\\?" | "\\" | "\\a" | "\\b" | "\\f" | "\\n" | "\\r" | "\\t" | "\\v"
+
+// XXX Missing lexer hack to tell between "T* t;" declaration and "t * t;" expression
+
+// XXX Missing ignoring slash newline, can't be done with
+//     %ignore /\\\n/
+//     because Lark splits tokens around that which is wrong
+
+%ignore WS
+%ignore C_COMMENT
+%ignore CPP_COMMENT
+
+FLOAT_SUFFIXED: FLOAT ("f" | "F" | "L" | "l")?
+INT_SUFFIXED: INT (INT_SIZE_SUFFIX INT_TYPE_SUFFIX? | INT_TYPE_SUFFIX INT_SIZE_SUFFIX?)?
+INT_SIZE_SUFFIX: "l" | "L" | "ll" | "LL"
+INT_TYPE_SUFFIX: "u" | "U"
+
+IDENTIFIER: CNAME
+
+// These are defined in common.lark
+%import common.ESCAPED_STRING
+%import common.FLOAT
+%import common.INT
+%import common.WS
+%import common.CNAME
+%import common.C_COMMENT
+%import common.CPP_COMMENT
