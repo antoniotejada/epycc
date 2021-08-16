@@ -22,12 +22,12 @@
 # ab(cd)*
     ab
     left-recursive cd
-    
+
 () right-recursive:
 # (gh)*ef
     ef
     gh right-recursive
-
+    
 () indirect-left-recursive:
 # ij|(mn|(ij|(mn|()op)kl)op)kl
     ij

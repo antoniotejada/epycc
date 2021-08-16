@@ -108,7 +108,7 @@ def parse_grammar(grammar_text):
     symbols = {}
     current_symbol = None
     for l in grammar_text:
-        if (is_empty(l)):
+        if (is_empty(l.strip())):
             # Allow and ignore empty lines
             print "ignoring empty line"
             
@@ -158,7 +158,7 @@ def parse_grammar(grammar_text):
                     
         else:
             # Comment
-            print "ignoring comment", l
+            print "ignoring comment", repr(l)
 
     return symbols
 
@@ -1334,13 +1334,6 @@ def find_terminal_symbols(symbols):
 
 
 def parse_top_down(symbols, start_symbol, program_tokens):
-    def create_stack_entry(symbol_name, rule_index, rule_symbol_index, rule_symbol_sub_index, token_index):
-        return Struct(
-            symbol_name=symbol_name, rule_index=rule_index, 
-            rule_symbol_index=rule_symbol_index, rule_symbol_sub_index=rule_symbol_sub_index,
-            token_index=token_index
-        )
-    
     def is_terminal(symbol):
         return symbol not in symbols
 
@@ -1410,6 +1403,30 @@ def parse_top_down(symbols, start_symbol, program_tokens):
                 once the max depth is increased again. It's possible the failure 
                 key will need to be enlarged to store the current max recursion 
                 level too
+
+
+            Left recursivity exhibits like this
+                S : A <EOF>
+                A : ab
+                    A cd
+            Given the token stream "abcdcdcd":
+            token index symbol[rule]    token, stack[rule]  comments
+            ab      0   S[0]: ^A EOF       
+            ab      0   A[0]: ^ab          (0, S[0])        success and advance of token
+            cd      1   A[0]: ab^          (0, S[0])        no more symbols in the rule, return to parent
+            cd      1   S[0]: A^EOF        ()               failure, added (0, (S[0], A[0])) to failures, reset rule index, token index
+            ab      0   S[0]: ^A EOF       ()               recurse into A
+            ab      0   A[0]: ^ab          (0, S[0])        failed because of previous failure, next rule
+            ab      0   A[1]: ^A cd        (0, S[0])        recurse into A 
+            ab      0   AA[0]: ^ab         (0, S[0], A[1])  success and advance of token (left recursion detected)
+            cd      1   AA[0]: ab          (0, S[0], A[1])  no more symbols in the rule, return to parent
+            cd      1   A[1]:  A^cd        (0, S[0])        success and advance of token
+            cd      2   AA[1]: A cd^       (0, S[0])        no more symbols in the rule, return to parent
+            cd      2   S[0]: A^EOF        ()               failure, added (0, S0, A[1]) to failures, reset rule index, token index
+            ab      0   S[0]: ^A EOF       ()               recurse into A
+            ab      0   A[0]: ^ab          (0, S[0])        failed because of previous failure (S[0], A[0]), next rule
+            ab      0   A[0]: ^ab          (0, S[0])        failed because of previous failure (S[0], A[1]), next rule
+
         """
         
         print "parsing token[%d]" % parser.token_index, parser.tokens[parser.token_index], "depth", parser.depth, "stack", parser.stack, "+", symbol.name
@@ -1421,6 +1438,7 @@ def parse_top_down(symbols, start_symbol, program_tokens):
         if (parser.depth >= max_parser_depth):
             print "depth overflow"
             # Record the failure
+            # XXX This is not correct anymore
             parser.failures.add(key)
             return False
 
@@ -1435,7 +1453,7 @@ def parse_top_down(symbols, start_symbol, program_tokens):
             # At least one rule must succeed to parse
             res = True
             rule_failed = False
-            key = (parser.token_index, tuple(parser.stack), rule_index)
+            key = (parser.token_index, tuple(parser.stack))
             if (key in parser.failures):
                 print "failing previous failure for rule", rule_str(symbol, rule_index), "with token[%d]" % parser.token_index, parser.tokens[parser.token_index]
                 res = False
@@ -1527,8 +1545,10 @@ def parse_top_down(symbols, start_symbol, program_tokens):
                     # other as successes
                     success_stack_entry = parser.success_stack[-1]
                     assert len(parser.success_stack)-1 == success_stack_entry.token_index
+
                     success_key = success_stack_entry.key
                     parser.failures.add(success_key)
+                        
                     del parser.success_stack[parser.token_index:]
                     assert (parser.token_index == len(parser.success_stack))    
                     # Force to retry this rule 
@@ -1542,7 +1562,7 @@ def parse_top_down(symbols, start_symbol, program_tokens):
         if (not res):
             # record the failure if not already
             parser.failures.add(key)
-        
+
         return res
 
 
@@ -1716,17 +1736,17 @@ def main():
         # Sample grammar to test specific cases
         grammar_filepath = "tests/test_grammar.txt"
         # Right recursive works
-        sample_program_tokens = ("right-recursive", ["gh","gh","gh","gh","gh","gh","gh","gh","ef"])
+        # sample_program_tokens = ("right-recursive", ["gh","gh","gh","gh","gh","gh","gh","gh","ef"])
         # Indirect right recursive works
-        sample_program_tokens = ("indirect-right-recursive", ["st", "wx", "st", "wx", "qr"])
+        # sample_program_tokens = ("indirect-right-recursive", ["st", "wx", "st", "wx", "qr"])
         # Function parameters using right recursion works
-        sample_program_tokens = ("function", ["ID", "ID", "(", "ID", "ID", ",", "ID", "ID", ")"])
+        #sample_program_tokens = ("function", ["ID", "ID", "(", "ID", "ID", ",", "ID", "ID", ")"])
         # XXX Left recursive doesn't work 
         sample_program_tokens = ("left-recursive", ["ab","cd","cd","cd","cd","cd","cd"])
         # XXX Indirect left recursive doesn't work
-        sample_program_tokens = ("indirect-left-recursive", ["ij","op","kl","op","kl","op","kl"])
+        #sample_program_tokens = ("indirect-left-recursive", ["ij","op","kl","op","kl","op","kl"])
         # Tagging a success as a failure works
-        sample_program_tokens = ("backtrack-success", ["ID", "ID" ])
+        #sample_program_tokens = ("backtrack-success", ["ID", "ID" ])
 
         test_topdown_parser(grammar_filepath, sample_program_tokens[1], sample_program_tokens[0])
 
