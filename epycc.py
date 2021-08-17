@@ -16,9 +16,6 @@ GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
-Extended filesystem for transparently reading files inside archives as if they
-were directories
-
 
 See
 - ISO/IEC 9899:1999 Annex A (aka C99) or ISO/IEC 9899:TC2 6.4.1 
@@ -51,20 +48,33 @@ def unpack_ops(ops):
     return [ (op.split(":")[0], op.split(":")[1]) for op in ops]
 
 def get_fn_name(*args):
-    l = [ binop_sign_to_name[args[0]] ]
+    """
+    Return a function name based on the incoming arguments: operation name, 
+    result type, parameter 1 type, parameter 2 type ...
+    """
+
+    # fn = "name__result_type__a_type__b_type..."
+    l = [ args[0] ]
     # Replace spaces in case of compound types ("unsigned long", etc)
     l.extend([arg.replace(" ", "_") for arg in args[1:]])
     
-    # fn = "%s %s__%s__%s__%s(%s a, %s b)
-    # XXX Missing "ass" versions (not necessary if implemented a = a + b ?
     return string.join(l, "__")
 
+def get_binop_fn_name(*args):
+    """
+    Return the given binop sign and argumetns function name
+    """
+    return get_fn_name( *([binop_sign_to_name[args[0]]] + list(args[1:])) )
+
 def get_llvm_type(t):
+    """
+    Return the llvm type corresponding to a C type
+    """
     # XXX Use some of the existing type list or snippets to build this?
     # XXX Calling this on every IR generation is error prone, should we 
     #     store this type in the symbol and have get_llvm_result_type, etc?
     #     Or just keep the llvm type around?
-    c_to_ir_types = {
+    c_to_irtypes = {
         "double" : "double",
         "float" : "float",
         "long long" :"i64",
@@ -83,9 +93,15 @@ def get_llvm_type(t):
         "signed char" : "signext i8",
         "unsigned char" : "zeroext i8",
     }
-    return c_to_ir_types[t]
+    # Make sure we are covering all qualified types
+    assert all((qualif_types.index(c_type) >= 0) for c_type in c_to_irtypes)
+    assert all((qualif_type in c_to_irtypes) for qualif_type in qualif_types)
+    return c_to_irtypes[t]
 
 def get_ctype(t):
+    """
+    Return the ctype corresponding to a C type
+    """
     c_to_ctypes = {
         "double" : ctypes.c_double,
         "float" : ctypes.c_float,
@@ -105,6 +121,9 @@ def get_ctype(t):
         "signed char" : ctypes.c_byte,
         "unsigned char" : ctypes.c_ubyte,
     }
+    # Make sure we are covering all qualified types
+    assert all((qualif_types.index(c_type) >= 0) for c_type in c_to_ctypes)
+    assert all((qualif_type in c_to_ctypes) for qualif_type in qualif_types)
     return c_to_ctypes[t]    
 
 
@@ -125,7 +144,10 @@ types = ["char", "short", "int", "long", "long long", "float", "double"]
 
 integer_types = set(["char", "short", "int", "long", "long long"])
 float_types = set(["float", "double"])
-integer_qualifs = ["unsigned"]
+# XXX Remove signed versions which map to plain anyway, and map to the non
+#     qualified type and standardize on unsigned and plain at symbol table
+#     creation time?
+integer_qualifs = ["unsigned", "signed"]
 
 qualif_types = types + [integer_qualif + " " + integer_type for integer_qualif in integer_qualifs for integer_type in integer_types]
 
@@ -153,57 +175,63 @@ def precompile_c_snippets():
 
     """
     l = []
-    for binop_sign, binop_name in binops:
-        for res_type in qualif_types:
-            for a_type in qualif_types:
-                for b_type in qualif_types:
-                    if ((binop_sign in int_ops) and (
-                        (a_type not in integer_types) or (b_type not in integer_types))
-                    ):
-                        continue
 
-                    # char add__char__char__char(char a, char b) { return (char) (a + b); }
-                    fn = "%s %s(%s a, %s b) { return (%s) (a %s b); }" % (
-                        res_type, 
-                        get_fn_name(binop_sign, res_type, a_type, b_type),
-                        a_type, b_type,
-                        res_type,
-                        binop_sign,
-                    )
+    # Operations are done in the same type and then the result converted 
+    # using a conversion function
 
-                    l.append(fn + "\n")
-
-                    # Assignment operators
-                    # char ass_add__char__char__char(char a, char b) { return (char) (a += b); }
-                    if (False):
-                        # XXX Work out assignment operators from binops a = a + b instead?
-                        if (binop_sign not in (rel_ops | logic_ops)):
-                            fn = "%s ass_%s(%s a, %s b) { return (%s) (a %s= b); }" % (
-                                res_type, 
-                                get_fn_name(binop_sign, res_type, a_type),
-                                a_type, b_type,
-                                res_type,
-                                binop_sign,
-                            )
-                            l.append(fn + "\n")
-                        
-
+    # XXX Should the forced cast exist? The highest ranked type is used for
+    #     operations anyway at codegen time?
+            
     for unop_sign, unop_name in unops:
-        for res_type in qualif_types:
-            for a_type in qualif_types:
-                    if ((unop_sign in int_ops) and (a_type not in integer_types)):
-                        continue
+        for c_type in qualif_types:
+            if ((unop_sign in int_ops) and (c_type not in integer_types)):
+                continue
 
-                    # int add__int__int(int a) { return (int) (+a); }
-                    fn = "%s %s__%s__%s(%s a) { return (%s) (%sa); }" % (
-                        res_type, 
-                        unop_name, res_type.replace(" ", "_"), a_type.replace(" ", "_"),
-                        a_type,
-                        res_type,
-                        unop_sign,
-                    )
+            # int add__int__int(int a) { return (int) (+a); }
+            fn = "%s %s(%s a) { return (%s) (%sa); }" % (
+                c_type, 
+                get_fn_name(unop_name, c_type, c_type),
+                c_type,
+                c_type,
+                unop_sign,
+            )
 
-                    l.append(fn + "\n")
+            l.append(fn + "\n")
+
+    for binop_sign, binop_name in binops:
+        for c_type in qualif_types:
+            # Don't do integer-only operations (bitwise, mod) on non-integer
+            # operands
+            if ((binop_sign in int_ops) and (c_type not in integer_types)):
+                continue
+
+            # char add__char__char__char(char a, char b) { return (char) (a + b); }
+            fn = "%s %s(%s a, %s b) { return (%s) (a %s b); }" % (
+                c_type, 
+                get_binop_fn_name(binop_sign, c_type, c_type, c_type),
+                c_type, c_type,
+                c_type,
+                binop_sign,
+            )
+
+            l.append(fn + "\n")
+
+            # Assignment operators will be done as a = a + b
+                
+    # Build the type conversion functions
+    for res_type in qualif_types:
+        for a_type in qualif_types:
+            # No need to generate for the same type (but note the table is still
+            # redundant for integer types since it contains eg signed int to int)
+            if (a_type != res_type):
+                # char cnv__char__int(int a) { return (char) a; }
+                fn = "%s %s(%s a) { return (%s) a; }" % (
+                    res_type, 
+                    get_fn_name("cnv", res_type, a_type),
+                    a_type,
+                    res_type,
+                )
+                l.append(fn + "\n")
 
 
     # Generate the C functions file in irs.c
@@ -225,8 +253,11 @@ def generate_ir(generator, node):
         return node
 
     def get_result_type(type_a, type_b):
-        # Types sorted by most general type first
-        types_precedence = [ 
+        # Types sorted by highest rank first
+        # XXX Review this really matches the c99 rank or find a way of 
+        #     extracting the result type of the C snippets or from some table
+        #     we build out of invoking clang with all the different combinations
+        types_highest_rank_first = [ 
             "double",
             "float",
             "long long",
@@ -246,9 +277,12 @@ def generate_ir(generator, node):
             "unsigned char",
         ]
         # XXX This could use a dict for faster lookups
-        result_type_index = min(types_precedence.index(type_a), types_precedence.index(type_b))
+        result_type_index = min(
+            types_highest_rank_first.index(type_a), 
+            types_highest_rank_first.index(type_b)
+        )
 
-        return types_precedence[result_type_index]
+        return types_highest_rank_first[result_type_index]
 
     def get_reg_and_type(a, irs, externs):
         """
@@ -286,24 +320,26 @@ def generate_ir(generator, node):
             # XXX Missing alignment
             # %3 = alloca float, align 4
             irs.append("%%%d = alloca %s, align 4" % (a_reg, a_llvm_type))
-            # store float 2.000000e+00, float* %3, align 4, !dbg !30
-            # LLVM complains if the float cannot be converted accurately, always
-            # pass floats in hex
+                        
+            if (a_type in ["float", "double"]):
+                # LLVM errors out if the float cannot be converted accurately,
+                # always pre-truncate and pass floats in hex, which LLVM
+                # requires to be provided in 64-bits even if it's going to a
+                # 32-bit float store (but still truncated to a value that will 
+                # fit in 32-bits)
+                a_value = a.value
+                if (a_type == "float"):
+                    # Store 64-bit but truncate to 32-bit first to prevent LLVM
+                    # erroring out with "floating point constant invalid for
+                    # type"
+                    a_value = (ctypes.c_float(a.value)).value
+                # XXX Review the endianness here?
+                a_llvm_value = "0x%016x" % struct.unpack("Q", struct.pack("d", a_value))
 
-            # XXX Review the endianness here?
-            
-            if (a_type == "float"):
-                # LLVM requires 64bit constants with lower 32 bit zeroes for
-                # 32-bit floats or fails with "error: floating point constant
-                # invalid for type"
-                a_llvm_value = "0x%08x00000000" % struct.unpack("I", struct.pack("f", a.value))
-
-            elif (a_type == "double"):
-                a_llvm_value = "0x%016x" % struct.unpack("Q", struct.pack("d", a.value))
-            
             else:
                 a_llvm_value = str(a.value)
             
+            # store float 2.000000e+00, float* %3, align 4, !dbg !30
             irs.append("store %s %s, %s* %%%d, align 4" % (a_llvm_type, a_llvm_value, a_llvm_type, a_reg))
             a_reg = generator.current_register
             generator.current_register += 1
@@ -321,6 +357,27 @@ def generate_ir(generator, node):
             a_reg = a.value_reg
 
         return a_reg, a_type
+
+    def generate_ir_call(generator, irs, externs, fn_name, res_type, type_reg_list):
+        """
+        Generates IR for the given call and the result type, with arguments type
+        and registers in type_reg_list
+
+        Returns the result register
+        """
+        res_reg = generator.current_register
+        generator.current_register += 1
+
+        # %5 = call float @mul__float__float__unsigned_int(float %1, unsigned int %4)
+        args = [
+            ("%s %%%d" % (get_llvm_type(type_reg_list[i*2]), type_reg_list[i*2+1])) 
+                for i in xrange(len(type_reg_list) / 2) 
+        ]
+        ir = "%%%d = call %s @%s(%s)" % (res_reg, get_llvm_type(res_type), fn_name, string.join(args, ","))
+        irs.append(ir)
+        externs.add(fn_name)
+
+        return res_reg
     
 
     gen_node = None
@@ -466,23 +523,21 @@ def generate_ir(generator, node):
             a_reg, a_type = get_reg_and_type(a, irs, externs)
             b_reg, b_type = get_reg_and_type(b, irs, externs)
             res_type = get_result_type(a_type, b_type)
-            fn_name = get_fn_name(op_sign, res_type, a_type, b_type)
 
-            res_reg = generator.current_register
-            # XXX This doesn't allocate registers in instruction order in case
-            #     of parenthesized expressions and breaks LLVM codegen, since it
-            #     expects registers in instruction increasing order, use the 
-            #     builder instead to generate code (right now this is fixedup
-            #     at function definition wrap-up)
-            generator.current_register += 1
+            # Convert the input types to the result type
+            if (a_type != res_type):
+                a_reg = generate_ir_call(generator, irs, externs,
+                    get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_reg])
+                
+            if (b_type != res_type):
+                b_reg = generate_ir_call(generator, irs, externs, 
+                    get_fn_name("cnv", res_type, b_type), res_type, [b_type, b_reg])
 
-            # %5 = call float @mul__float__float__unsigned_int(float %1, unsigned int %4)
-            ir = "%%%d = call %s @%s(%s %%%d, %s %%%d)" % (
-                res_reg, get_llvm_type(res_type), fn_name, 
-                get_llvm_type(a_type), a_reg, get_llvm_type(b_type), b_reg
-            )
-            irs.append(ir)
-            externs.add(fn_name)
+            # Perform the operation in res_type
+            fn_name = get_binop_fn_name(op_sign, res_type, res_type, res_type)
+            res_reg = generate_ir_call(generator, irs, externs, fn_name, 
+                res_type, [res_type, a_reg, res_type, b_reg])
+
             gen_node = Struct(type="ir", value_type=res_type, value_reg = res_reg, value=irs, externs=externs)
 
         elif (node.data == "parameter_declaration"):
@@ -564,11 +619,15 @@ def generate_ir(generator, node):
             fn.ir = gen_node[2]
 
 
-            # Right now we generate IR with unique register indices but
-            # not guaranteed to be monotonically increasing because the indices
-            # are allocated at expression parsing time, which is not the same as
-            # line execution time. LLVM will error out if it finds non-monotonically
-            # increasing register indices. Reindex the registers
+            # Right now we generate IR with unique register indices but not
+            # guaranteed to be monotonically increasing wrt where they appear in
+            # the sequence of instructions. The indices are allocated at
+            # expression parsing time, which is not the same as instruction
+            # execution order (eg in the presence of parenthesis,etc). LLVM will
+            # error out if it finds non-monotonically increasing register
+            # indices. Reindex the registers so they are monotonically
+            # increasing wrt instruction execution order
+
             # XXX This should be fixed by using llvmlite's IrBuilder instead 
             #     of strings?
             
@@ -686,10 +745,12 @@ def llvm_compile(llvm_ir, function_signatures):
     # XXX Need to keep some of these around to prevent access violations when
     #     calling the function right after leaving this function, presumably
     #     because of garbage collection, find out which ones
-    setattr(jit_lib, "mod", mod)
-    setattr(jit_lib, "tm", target_machine)
-    setattr(jit_lib, "engine", engine)
-    setattr(jit_lib, "asm", target_machine.emit_assembly(mod))
+    
+    jit_lib.mod = mod
+    jit_lib.tm = target_machine
+    jit_lib.engine = engine
+    jit_lib.asm = target_machine.emit_assembly(mod)
+    jit_lib.ir = str(mod)
     
     
     # Optimize the module
@@ -698,7 +759,8 @@ def llvm_compile(llvm_ir, function_signatures):
     pmb.populate(pm)
     pm.run(mod)
 
-    setattr(jit_lib, "asm_optimized", target_machine.emit_assembly(mod))
+    jit_lib.ir_optimized = str(mod)
+    jit_lib.asm_optimized = target_machine.emit_assembly(mod)
     
     for function_signature in function_signatures:
 
@@ -708,6 +770,8 @@ def llvm_compile(llvm_ir, function_signatures):
         # Run the function via ctypes
         cfunc = ctypes.CFUNCTYPE(*function_signature.ctypes)(func_ptr)
         setattr(jit_lib, function_signature.name, cfunc)
+
+    # XXX Missing publishing the globals once there's global support
         
     return jit_lib
 
@@ -807,7 +871,6 @@ def epycc_compile(source):
 
     llvm_ir = string.join(llvm_ir, "\n")
 
-    print llvm_ir
     lib = llvm_compile(llvm_ir, function_signatures)
 
     return lib
@@ -821,6 +884,8 @@ if (__name__ == "__main__"):
     source = open("tests/ops.c").read()
 
     lib = epycc_compile(source)
-    print lib.asm
-    print lib.asm_optimized
+    print lib.ir
+    print lib.ir_optimized
+    #print lib.asm
+    #print lib.asm_optimized
     print lib.f2pow2(2)
