@@ -15,7 +15,7 @@ print jit_lib.f2pow2(2)
 8.0
 ```
 
-Internally it generates LLVM IR and uses [llvmmlite](https://github.com/numba/llvmlite/) to JIT compile it into executable machine code.
+Internally it generates LLVM IR and uses [llvmlite](https://github.com/numba/llvmlite/) to JIT compile it into executable machine code.
 
 The generated LLVM IR code calls into LLVM IR snippets pregenerated from C code. This is in order to accelerate epycc development and perform some tiring tasks like C99-compliant type conversion, etc:
 
@@ -114,4 +114,4 @@ Since the module includes a full featured C parser, it can also be used to parse
 - C99 grammar straight and unmodified from the 9899:1999 spec
 - Clang for precompiling C code into IR snippets that get called internally.
 - [Lark](https://github.com/lark-parser/lark) for parsing
-- [llvmmlite](https://github.com/numba/llvmlite/) for JIT compiling LLVM IR into executable code.
+- [llvmlite](https://github.com/numba/llvmlite/) for JIT compiling LLVM IR into executable code.
