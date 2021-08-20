@@ -44,8 +44,51 @@ import lark
 import llvmlite.binding as llvm
 
 
-def unpack_ops(ops):
+def unpack_op_sign_names(ops):
     return [ (op.split(":")[0], op.split(":")[1]) for op in ops]
+
+# XXX All these should be exposed in a nice way for consumers of the parser
+binops = unpack_op_sign_names([
+    "+:add", "-:sub", "*:mul", "/:div", "%:mod",
+    "<<:lshift", ">>:rshift",
+    "<:lt", "<=:lte", ">:gt", ">=:gte","==:eq", "!=:neq",
+    "&:bitand", "|:bitor", "^:bitxor",
+    "&&:and", "||:or",
+])
+
+# XXX Missing post-pre incr
+prepostops = [ "++", "--" ]
+
+unops = unpack_op_sign_names(["+:add", "-:sub", "~:bitnot", "!:not"])
+
+unspecified_integer_types = set(["_Bool", "char", "short", "int", "long", "long long"])
+float_types = set(["float", "double", "long double"])
+unspecified_types = unspecified_integer_types | float_types
+specifiable_integer_types = unspecified_integer_types - set(["_Bool"])
+
+# XXX Remove signed versions which map to plain anyway, and map to the non
+#     specified type and standardize on unsigned and plain at symbol table
+#     creation time?
+integer_specifiers = set(["unsigned", "signed"])
+specified_integer_types = set(
+    [(integer_specif + " " + integer_type) for integer_specif in integer_specifiers for integer_type in specifiable_integer_types]
+)
+integer_types = unspecified_integer_types | specified_integer_types
+
+# XXX Note on clang char is signed on x86, unsigned on ARM
+unsigned_integer_types = set(["_Bool"] + [integer_type for integer_type in integer_types if "unsigned" in integer_type])
+signed_integer_types = integer_types - unsigned_integer_types
+
+# XXX Missing _Complex
+all_types = float_types | integer_types
+
+int_ops = set(["|", "&", "^", "%", "<<", ">>", "!", "~"])
+rel_ops = set(["<", "<=", ">", ">=","==", "!="])
+logic_ops = set(["&&", "||"])
+
+binop_sign_to_name = { binop_sign : binop_name for binop_sign, binop_name in binops }
+
+# XXX Missing memory operators * . -> &
 
 def get_fn_name(*args):
     """
@@ -60,11 +103,27 @@ def get_fn_name(*args):
     
     return string.join(l, "__")
 
-def get_binop_fn_name(*args):
+
+def get_llvm_type_ext(t):
     """
-    Return the given binop sign and argumetns function name
+    This is used for the contract between the caller and the callee, whether
+    to signextend to the architecture word size or not.
+    The caller looks at the parameters ext, the callee looks at the function ext
+    - The function is ext type
+    - Parameters are type ext
+    Looks like on x86 only i1 needs to be specified with ext since x86 can use
+    8bit and 16bit values natively (other arches would need to extend before
+    and/or after the call)
+    
+    Setting it does change the generated code on x86, causing 8-bit to 32-bit
+    sign/zero extension so for now it's only set where needed for x86
     """
-    return get_fn_name( *([binop_sign_to_name[args[0]]] + list(args[1:])) )
+    c_to_irext = {
+        "_Bool" : "zeroext",
+    }
+
+    return c_to_irext.get(t, "")
+
 
 def get_llvm_type(t):
     """
@@ -75,34 +134,39 @@ def get_llvm_type(t):
     #     store this type in the symbol and have get_llvm_result_type, etc?
     #     Or just keep the llvm type around?
     c_to_irtypes = {
+        "long double" : "x86_fp80",
         "double" : "double",
         "float" : "float",
         "long long" :"i64",
         "signed long long" : "i64",
         "unsigned long long" : "i64", 
+        # XXX This depends on LLP64/etc windows is 32-bit
         "long": "i32",
         "signed long" : "i32",
         "unsigned long" : "i32",
         "int" : "i32",
         "signed int": "i32",
         "unsigned int" : "i32",
-        "short" : "signext i16",
-        "signed short" : "signext i16",
-        "unsigned short" : "zeroext i16",
-        "char" : "signext i8",
-        "signed char" : "signext i8",
-        "unsigned char" : "zeroext i8",
+        "short" : "i16",
+        "signed short" : "i16",
+        "unsigned short" : "i16",
+        "char" : "i8",
+        "signed char" : "i8",
+        "unsigned char" : "i8",
+        "_Bool" : "i1",
     }
-    # Make sure we are covering all qualified types
-    assert all((qualif_types.index(c_type) >= 0) for c_type in c_to_irtypes)
-    assert all((qualif_type in c_to_irtypes) for qualif_type in qualif_types)
+    # Make sure we are covering all types
+    assert all((c_type in all_types) for c_type in c_to_irtypes)
+    assert all((c_type in c_to_irtypes) for c_type in all_types)
+    
     return c_to_irtypes[t]
-
+        
 def get_ctype(t):
     """
-    Return the ctype corresponding to a C type
+    Return the Python ctype corresponding to a C type
     """
     c_to_ctypes = {
+        "long double" : ctypes.c_longdouble,
         "double" : ctypes.c_double,
         "float" : ctypes.c_float,
         "long long" : ctypes.c_longlong,
@@ -120,47 +184,31 @@ def get_ctype(t):
         "char" : ctypes.c_char,
         "signed char" : ctypes.c_byte,
         "unsigned char" : ctypes.c_ubyte,
+        "_Bool" : ctypes.c_bool,
     }
-    # Make sure we are covering all qualified types
-    assert all((qualif_types.index(c_type) >= 0) for c_type in c_to_ctypes)
-    assert all((qualif_type in c_to_ctypes) for qualif_type in qualif_types)
+    # Make sure we are covering specified types
+    assert all((c_type in all_types) for c_type in c_to_ctypes)
+    assert all((c_type in c_to_ctypes) for c_type in all_types)
+
     return c_to_ctypes[t]    
 
 
-binops = unpack_ops([
-    "+:add", "-:sub", "*:mul", "/:div", "%:mod",
-    "<<:lshift", ">>:rshift",
-    "<:lt", "<=:lte", ">:gt", ">=:gte","==:eq", "!=:neq",
-    "&:bitand", "|:bitor", "^:bitxor",
-    "&&:and", "||:or",
-])
+def invoke_clang(c_filepath, ir_filepath, options=""):
+    # Generate the precompiled IR in irs.ir
+    # clang_filepath = R"C:\android-ndk-r15c\toolchains\llvm\prebuilt\windows-x86_64\bin\clang.exe"
+    clang_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_out", "clang.exe")
+    # For privacy reasons and since some ir files are pushed to the repo, don't
+    # leak the local path in the LLVM moduleid comment of 
+    cmd = R"%s -mllvm --x86-asm-syntax=intel -S -std=c99 -emit-llvm %s -o %s %s" % (
+        clang_filepath,
+        options,
+        os.path.relpath(ir_filepath),
+        os.path.relpath(c_filepath)
+    )
+    os.system(cmd)
 
-# XXX Missing post-pre incr
-prepostops = [ "++", "--" ]
 
-unops = unpack_ops(["+:add", "-:sub", "~:bitnot", "!:not"])
-
-types = ["char", "short", "int", "long", "long long", "float", "double"]
-
-integer_types = set(["char", "short", "int", "long", "long long"])
-float_types = set(["float", "double"])
-# XXX Remove signed versions which map to plain anyway, and map to the non
-#     qualified type and standardize on unsigned and plain at symbol table
-#     creation time?
-integer_qualifs = ["unsigned", "signed"]
-
-qualif_types = types + [integer_qualif + " " + integer_type for integer_qualif in integer_qualifs for integer_type in integer_types]
-
-int_ops = set(["|", "&", "^", "%", "<<", ">>", "!", "~"])
-rel_ops = set(["<", "<=", ">", ">=","==", "!="])
-logic_ops = set(["&&", "||"])
-
-binop_sign_to_name = { binop_sign : binop_name for binop_sign, binop_name in binops }
-
-# XXX Missing memory operators * . -> &
-# XXX Missing cast operator? ()
-
-def precompile_c_snippets():
+def precompile_c_snippets(generated_c_filepath, generated_ir_filepath):
     """
     Generate a file containing one C function implementing every C operation and
     type.
@@ -169,11 +217,12 @@ def precompile_c_snippets():
 
         %CLANG% -mllvm -S -std=c99 --x86-asm-syntax=intel -emit-llvm -o- generated/irs.c
 
-    and generate LLVM IR that can be read from epycc to do the runtime codegen (the
-    asm-syntax option is needed so clang doesn't error trying to generate object
-    code)
+    and generate LLVM IR that can be read from epycc to do the runtime codegen
+    (the -S is needed so clang doesn't error trying to generate object code)
 
     """
+    print "Precompiling C snippets"
+
     l = []
 
     # Operations are done in the same type and then the result converted 
@@ -183,7 +232,7 @@ def precompile_c_snippets():
     #     operations anyway at codegen time?
             
     for unop_sign, unop_name in unops:
-        for c_type in qualif_types:
+        for c_type in all_types:
             if ((unop_sign in int_ops) and (c_type not in integer_types)):
                 continue
 
@@ -199,7 +248,7 @@ def precompile_c_snippets():
             l.append(fn + "\n")
 
     for binop_sign, binop_name in binops:
-        for c_type in qualif_types:
+        for c_type in all_types:
             # Don't do integer-only operations (bitwise, mod) on non-integer
             # operands
             if ((binop_sign in int_ops) and (c_type not in integer_types)):
@@ -208,7 +257,7 @@ def precompile_c_snippets():
             # char add__char__char__char(char a, char b) { return (char) (a + b); }
             fn = "%s %s(%s a, %s b) { return (%s) (a %s b); }" % (
                 c_type, 
-                get_binop_fn_name(binop_sign, c_type, c_type, c_type),
+                get_fn_name(binop_name, c_type, c_type, c_type),
                 c_type, c_type,
                 c_type,
                 binop_sign,
@@ -219,8 +268,8 @@ def precompile_c_snippets():
             # Assignment operators will be done as a = a + b
                 
     # Build the type conversion functions
-    for res_type in qualif_types:
-        for a_type in qualif_types:
+    for res_type in all_types:
+        for a_type in all_types:
             # No need to generate for the same type (but note the table is still
             # redundant for integer types since it contains eg signed int to int)
             if (a_type != res_type):
@@ -235,15 +284,10 @@ def precompile_c_snippets():
 
 
     # Generate the C functions file in irs.c
-    with open("generated/irs.c", "w") as f:
+    with open(generated_c_filepath, "w") as f:
         f.writelines(l)
 
-    # Generate the precompiled IR in irs.ir
-    clang_filepath = R"C:\android-ndk-r15c\toolchains\llvm\prebuilt\windows-x86_64\bin\clang.exe"
-    cmd = R"%s -mllvm --x86-asm-syntax=intel -S -std=c99 -emit-llvm -o generated/irs.ir generated/irs.c" % (
-        clang_filepath
-    )
-    os.system(cmd)
+    invoke_clang(generated_c_filepath, generated_ir_filepath)
 
 
 def generate_ir(generator, node):
@@ -252,37 +296,195 @@ def generate_ir(generator, node):
             node = get_grandson(node.children[parent_indices[0]], parent_indices[1:])
         return node
 
-    def get_result_type(type_a, type_b):
+    def get_tree_tokens(node):
+        # XXX This could use 
+        #     all_tokens = tree.scan_values(lambda v: isinstance(v, Token))
+        # but it's not sure we want to be that Lark dependent yet
+        tokens = []
+        if (isinstance(node, lark.Token)):
+            tokens = [node.value]
+
+        else:
+            for child in node.children:
+                tokens.extend(get_tree_tokens(child))
+
+        return tokens
+
+    def is_integer_type(a_type):
+        return (a_type in integer_types)
+
+    def is_unsigned_integer_type(a_type):
+        return a_type in unsigned_integer_types
+
+    def is_signed_integer_type(a_type):
+        return a_type in signed_integer_types
+
+    def get_unspecified_type(a_type):
+        if (is_integer_type(a_type)):
+            # Remove unsigned or signed from the type
+            a_type = a_type.replace("unsigned", "").replace("signed","").strip()
+            if (a_type == ""):
+                a_type = "int"
+
+        return a_type
+
+    def get_type_bytes(a_type):
+        type_sizes = {
+            "long double" : 16,
+            "double" : 8,
+            "float" : 4,
+            "long long" : 8,
+            "signed long long" : 8,
+            "unsigned long long" : 8,
+            # XXX This depends on LLP64 vs LP64 windows is LLP64
+            "long" : 4,
+            "signed long" : 4,
+            "unsigned long" : 4,
+            "int" : 4,
+            "signed int" : 4,
+            "unsigned int" : 4,
+            "short" : 2,
+            "signed short" : 2,
+            "unsigned short" : 2,
+            "char" : 1,
+            "signed char" : 1,
+            "unsigned char" : 1,
+            "_Bool" : 1,
+        }
+
+        return type_sizes[a_type]
+
+
+    def get_result_type(op_sign, a_type, b_type):
         # Types sorted by highest rank first
         # XXX Review this really matches the c99 rank or find a way of 
         #     extracting the result type of the C snippets or from some table
         #     we build out of invoking clang with all the different combinations
-        types_highest_rank_first = [ 
-            "double",
-            "float",
-            "long long",
-            "signed long long",
-            "unsigned long long",
-            "long",
-            "signed long",
-            "unsigned long",
-            "int",
-            "signed int",
-            "unsigned int",
-            "short",
-            "signed short",
-            "unsigned short",
-            "char",
-            "signed char",
-            "unsigned char",
-        ]
-        # XXX This could use a dict for faster lookups
-        result_type_index = min(
-            types_highest_rank_first.index(type_a), 
-            types_highest_rank_first.index(type_b)
-        )
+        # Ranks
+        #  float < double < long double
+        #  _Bool < char < short < int < long < long long
+        # signed and unsigned have the same rank
+        # the lowest ranked floating type has a higher rank than any integer
+        type_ranks = {
+            "long double" : 8, 
+            "double" : 7,
+            "float" : 6, 
+            "long long" : 5,
+            "signed long long" : 5,
+            "unsigned long long" : 5,
+            "long" : 4,
+            "signed long": 4,
+            "unsigned long" : 4,
+            "int" : 3,
+            "signed int" : 3,
+            "unsigned int" : 3,
+            "short" : 2,
+            "signed short" : 2,
+            "unsigned short" : 2,
+            "char" : 1,
+            "signed char" : 1,
+            "unsigned char" : 1,
+            "_Bool" : 0,
+        }
+        # Make sure we are covering all specified types
+        assert all((c_type in all_types) for c_type in type_ranks)
+        assert all((c_type in type_ranks) for c_type in all_types)
+        
+        def get_ranked_types(a_type, b_type):
+            a_type_rank = type_ranks[a_type]
+            b_type_rank = type_ranks[b_type]
+            if (a_type_rank >= b_type_rank):
+                return a_type, b_type
+            else:
+                return b_type, a_type
+            
+        def a_or_b_type_is(c_type):
+            return ((a_type == c_type) or (b_type == c_type))
+    
 
-        return types_highest_rank_first[result_type_index]
+        # XXX This could prebuild the cross product table of operands and results
+        #     offline so it doesn't need to check at runtime
+
+
+        # See https://www.oreilly.com/library/view/c-in-a/0596006977/ch04.html
+        # See 6.3 conversions of ISO/IEC 9899:1999
+        # Every integer has a rank
+        #  _bool < char < short < int < long < long long
+        # rank(enum) = rank(compatible int type)
+        # rank(signed type) = rank(unsigned type)
+        # Floating point are ranked
+        #  float < double < long double
+        # Integer promotion:
+        # - if an int can represent all ranges of a type, an int is used
+        # - else an unsigned int
+        # plain char signedness is implementation dependent (on clang signed on x86
+        # but unsigned on arm)
+        # Bool: Any type is 0 if equals to 0, otherwise 1
+        # ... more conversion rules
+        # Usual arithmetic conversions 6.3.1.8
+        # The usual arithmetic conversions are performed implicitly for the following operators:
+
+        # XXX Missing checking the op is one of usual arithmetic:
+        #     - Arithmetic operators with two operands: *, /, %, +, and -
+        #     - Relational and equality operators: <, <=, >, >=, ==, and !=
+        #     - The bitwise operators, &, |, and ^
+        #     - The conditional operator, ?: (for the second and third operands)
+
+        if (a_or_b_type_is("long double")):
+            res_type = "long double"
+
+        elif (a_or_b_type_is("double")):
+            res_type = "double"
+
+        elif (a_or_b_type_is("float")):
+            res_type = "float"
+
+        else:
+            # The type is integer, do integer promotions
+            assert(is_integer_type(a_type))
+            assert(is_integer_type(b_type))
+
+            a_promoted_type = a_type
+            b_promoted_type = b_type
+
+
+            # If an int can represent all the values of the original type
+            # use int otherwise unsigned int
+            if (get_type_bytes(a_type) < get_type_bytes("int")):
+                a_promoted_type = "int"
+            if (get_type_bytes(b_type) < get_type_bytes("int")):
+                b_promoted_type = "int"
+            # XXX Missing 6.3.1.3 rules
+
+            highest_ranked_type, lowest_ranked_type = get_ranked_types(a_promoted_type, b_promoted_type)
+            # apply rules to promoted operands
+            if (a_promoted_type == b_promoted_type):
+                # Same promoted type, pick any
+                res_type = a_promoted_type
+
+            elif (is_signed_integer_type(a_promoted_type) == is_signed_integer_type(b_promoted_type)):
+                # Both are signed or both are unsigned, return highest ranked type
+                res_type = highest_ranked_type
+
+            elif (is_unsigned_integer_type(highest_ranked_type)):
+                # unsigned has higher or equal rank, pick unsigned
+                res_type = highest_ranked_type
+
+            elif (get_type_bytes(highest_ranked_type) > get_type_bytes(lowest_ranked_type)):
+                # highest ranked type is signed and can represent all the values of the unsigned, pick signed
+                res_type = highest_ranked_type
+
+            else:
+                # pick unsigned type of the signed type
+                if (is_signed_integer_type(a_promoted_type)):
+                    res_type = a_promoted_type
+                else:
+                    res_type = b_promoted_type
+
+                if (res_type != "_Bool"):
+                    res_type = "unsigned " + res_type.replace("signed", "").strip()
+                
+        return res_type
 
     def get_reg_and_type(a, irs, externs):
         """
@@ -398,7 +600,12 @@ def generate_ir(generator, node):
             #         identifier	fadd
             # ['float', ['fadd', '(', [['float', 'a'], ',', ['float', 'b']], ')'], ['{', ['return', ['a', '+', 'b'], ';'], '}']]
             function_type, function_name = (
-                get_grandson(node, (0, 0, 0)).value, 
+                # XXX This assumes the type is basic type
+                # XXX This should be done once declaration_specifiers are read,
+                #     but we need the function in the symbol table before the
+                #     compound statement is read for recursive functions and
+                #     with the type?
+                string.join(get_tree_tokens(node.children[0]), " "), 
                 get_grandson(node, (1, 0, 0, 0, 0)).value
             )
             generator.symbol_table[-2][function_name] = Struct(type = "function", name=function_name, value_type=function_type)
@@ -438,6 +645,13 @@ def generate_ir(generator, node):
                 # compound_statement:  "{" block_item_list? "}"
                 gen_node = generate_ir(generator, node.children[1])
 
+            elif (node.data == "cast_expression"):
+                # cast_expression: ... |  "(" type_name ")" cast_expression
+                gen_node = [
+                    generate_ir(generator, node.children[1]),
+                    generate_ir(generator, node.children[3])
+                ]
+
             elif (node.data == "expression_statement"):
                 # expression_statement:  expression? ";"
                 if (len(node.children) > 1):
@@ -475,29 +689,43 @@ def generate_ir(generator, node):
         #
         
         # trap any expression that hasn't been resolved to a single node
-        if ((node.data == "jump_statement") and (node.children[0].value == "return")):
-            # Generate the return code
-            # ret float %11, !dbg !29
-            # ret void, !dbg !33
-            externs = set()
-            if (gen_node is None):
-                irs = ["ret void"]
-
+        if ((node.data == "type_name") or (node.data == "declaration_specifiers")):
+            # XXX Right now assume there's only one type and it's one of the
+            #     basic types, once complex types are supported, the types will
+            #     have to be put in the symbol table and parsed properly
+            res_type = get_tree_tokens(node)
+            res_type = string.join(res_type, " ")
+            gen_node = res_type
+                
+        elif (node.data == "cast_expression"):
+            # Always make sure expressions leave as IR nodes. 
+            # This takes care of not pushing constants and identifiers up
+            # XXX This could be done earlier in primary_expression
+            # XXX This may make harder detecting constants upstream?
+            
+            # Convert to type if different, otherwise pass through making sure
+            # an IR node is created if necessary
+            if (isinstance(gen_node, list)):
+                # There's a cast operator, deal with it
+                res_type = gen_node[0]
+                gen_node = gen_node[1]
             else:
-                # Note this can be a straight constant, so always create a new
-                # ir node and get the reg and type
-                irs = []
-                
-                ret_reg, ret_type = get_reg_and_type(gen_node, irs, externs)
-                # XXX Needs to truncate to function's return value type but
-                #     it's not available here?
-                #   %8 = fptrunc double %7 to float, !dbg !9670
-                # XXX Do this with snippets
-                irs.append("ret %s %%%d" % (get_llvm_type(ret_type), ret_reg))
-                
-            gen_node = Struct(type="ir", value_type=None, value_reg=None, value=irs, externs=externs)
-                
-        elif (node.data.endswith("_expression") and ((type(gen_node) is list) and len(gen_node) == 3)):
+                res_type = None
+            
+            irs = []
+            externs = set()
+            a_reg, a_type = get_reg_and_type(gen_node, irs, externs)
+            
+            if ((res_type is not None) and (res_type != a_type)):
+                res_reg = generate_ir_call(generator, irs, externs,
+                    get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_reg])
+            else:
+                res_reg = a_reg
+                res_type = a_type
+
+            gen_node = Struct(type="ir", value_type=res_type, value_reg=res_reg, value=irs, externs=externs)
+
+        elif (node.data.endswith("_expression") and isinstance(gen_node, list) and (len(gen_node) == 3)):
             
             a, op_sign, b = gen_node
 
@@ -522,7 +750,7 @@ def generate_ir(generator, node):
             #     and then data conversion functions.
             a_reg, a_type = get_reg_and_type(a, irs, externs)
             b_reg, b_type = get_reg_and_type(b, irs, externs)
-            res_type = get_result_type(a_type, b_type)
+            res_type = get_result_type(op_sign, a_type, b_type)
 
             # Convert the input types to the result type
             if (a_type != res_type):
@@ -534,7 +762,7 @@ def generate_ir(generator, node):
                     get_fn_name("cnv", res_type, b_type), res_type, [b_type, b_reg])
 
             # Perform the operation in res_type
-            fn_name = get_binop_fn_name(op_sign, res_type, res_type, res_type)
+            fn_name = get_fn_name(binop_sign_to_name[op_sign], res_type, res_type, res_type)
             res_reg = generate_ir_call(generator, irs, externs, fn_name, 
                 res_type, [res_type, a_reg, res_type, b_reg])
 
@@ -608,7 +836,7 @@ def generate_ir(generator, node):
             parameters = []
             parameter_nodes = gen_node[1][2]
             if (parameter_nodes != ")"):
-                if (type(parameter_nodes) is not list):
+                if (not isinstance(parameter_nodes, list)):
                     parameter_nodes = [parameter_nodes]
                 for parameter_node in parameter_nodes:
                     # [{value_reg: 0, value... variable}, ',', {value_reg: 1, value... variable}]
@@ -618,6 +846,37 @@ def generate_ir(generator, node):
             fn.parameters = parameters
             fn.ir = gen_node[2]
 
+            # If the return type is different from the block type, convert
+            if (fn.value_type != fn.ir.value_type):
+                a_type = fn.ir.value_type
+                a_reg = fn.ir.value_reg
+                res_type = fn.value_type
+                irs = fn.ir.value
+                externs = fn.ir.externs
+                res_reg = generate_ir_call(generator, irs, externs,
+                    get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_reg])
+        
+                fn.ir = Struct(type="ir", value_type=res_type, value_reg=res_reg, value=irs, externs=externs)
+                
+            # Now really return the value
+            # ret float %11, !dbg !29
+            # ret void, !dbg !33
+            irs = fn.ir.value
+            externs = fn.ir.externs
+            res_reg = fn.ir.value_reg
+            res_type = fn.ir.value_type
+            if (fn.value_type == "void"):
+                irs.append("ret void")
+
+            else:
+                # Note this can be a straight constant, so always create a new
+                # ir node and get the reg and type
+                irs = []
+                externs = set()
+                res_reg, res_type = get_reg_and_type(fn.ir, irs, externs)
+                irs.append("ret %s %%%d" % (get_llvm_type(res_type), res_reg))
+                
+            fn.ir = Struct(type="ir", value_type=res_type, value_reg=res_reg, value=irs, externs=externs)
 
             # Right now we generate IR with unique register indices but not
             # guaranteed to be monotonically increasing wrt where they appear in
@@ -647,7 +906,7 @@ def generate_ir(generator, node):
                 
             gen_node = generator.symbol_table[-2][function_name]
         
-    elif (type(node) is lark.Token):
+    elif (isinstance(node, lark.Token)):
         gen_node = node.value
 
     else:
@@ -656,24 +915,41 @@ def generate_ir(generator, node):
     return gen_node
 
 
+llvm_initialized = False
 
 def llvm_compile(llvm_ir, function_signatures):
-    # This switches the assembler emit from at&t to intel, needs to be done
-    # before initializing llvmlite, otherwise it's ignored
-    # XXX This probably doesn't affect the input assembler, only the output, which
-    #     has to be done in AT&T eg
-    #       call void asm sideeffect "movl %eax, %eax", "~{dirflag},~{fpsr},~{flags}"() #2
-    llvm.set_option('', '--x86-asm-syntax=intel')
+    global llvm_initialized
+    if (not llvm_initialized):
+        # This switches the assembler emit from at&t to intel, needs to be done
+        # before initializing llvmlite, otherwise it's ignored
+        # Will also give a warning
+        #       "for the -x86-asm-syntax option: may only occur zero or one times!"
+        # when llvm_compile is initialized more than once (but other than that
+        # multiple initialization doesn't seem to be a problem)
+    
+        # XXX This probably doesn't affect the input assembler, only the output, which
+        #     has to be done in AT&T eg
+        #       call void asm sideeffect "movl %eax, %eax", "~{dirflag},~{fpsr},~{flags}"() #2
 
-    # All these initializations are required for code generation!
-    llvm.initialize()
-    llvm.initialize_native_target()
-    llvm.initialize_native_asmprinter()  # yes, even this one
+
+        llvm.set_option('', '--x86-asm-syntax=intel')
+
+        # All these initializations are required for code generation
+        
+        llvm.initialize()
+        llvm.initialize_native_target()
+        llvm.initialize_native_asmprinter()  # yes, even this one
+
+        llvm_initialized = True
+
+        # XXX Reuse some of the objects created below across llvm_compile 
+        #     invocations?
 
     def create_target_machine():
         # Create a target machine representing the host
         target = llvm.Target.from_default_triple()
         target_machine = target.create_target_machine()
+
         return target_machine
 
     def create_execution_engine(target_machine):
@@ -775,8 +1051,31 @@ def llvm_compile(llvm_ir, function_signatures):
         
     return jit_lib
 
+def load_functions_ir(ir_filepath):
+    ir_functions = {}
+    with open(ir_filepath, "r") as f:
+        ir_function = None
+        for l in f:
+            # define signext i8 @add__char__char__char(i8 signext, i8 signext) #0 {
+            l = l.strip()
+            if (l.endswith("{")):
+                ir_function = []
+                m = re.search("@([^(]+)", l)
+                function_name = m.group(1)
 
-def epycc_compile(source):
+            if (ir_function is not None):
+                ir_function.append(l)
+
+            # Note clang puts some debug lines that end in }, only deal with }
+            # if we are inside a function
+            if ((ir_function is not None) and (l.endswith("}"))):
+                ir_functions[function_name] = ir_function
+                function_name = None
+                ir_function = None
+    return ir_functions
+
+
+def epycc_generate(source):
     # XXX check if we can tag which tokens to keep with "!" in the rule instead 
     #     of keep_all_tokens
 
@@ -797,38 +1096,36 @@ def epycc_compile(source):
     #    ambiguity (this can be seen when opened with ambiguity="explicit", there
     #    are no trees due to T* t; under _ambig node), so still requires some 
     #    lexer hack or such
-    parser = lark.Lark.open('grammars/c99_phrase_structure_grammar.lark', 
-      keep_all_tokens="True", lexer="standard", debug=True)
+
+    # XXX Earley is really slow (~13 lines per second) and causes stack overflow
+    #     with long C files (thousands of lines). Massage the grammar to be
+    #     LALR(1) and switch to LALR parser. Optionallly once epycc can
+    #     bootstrap itself and write the parser code code in C (the AST
+    #     traversal can remain in Python).
+    grammar_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+        "grammars", "c99_phrase_structure_grammar.lark")
+    parser = lark.Lark.open(grammar_filepath, keep_all_tokens="True", 
+        lexer="standard")
     tree = parser.parse(source)
 
-    ## print tree.pretty()
+    #print tree.pretty()
 
     # XXX Do a proper symbol table with multi-level lookup (each level is a different
     #     scope)
     generator = Struct(symbol_table=[{}, {}], current_register = 0)
     irs = generate_ir(generator, tree)
 
-    ## print irs
-    ## print generator.symbol_table
+    epycc_dirpath = os.path.dirname(os.path.abspath(__file__))
+    generated_c_filepath = os.path.join(epycc_dirpath, "generated", "irs.c")
+    generated_ir_filepath = os.path.join(epycc_dirpath, "generated", "irs.ir")
 
-    all_externs = {}
-    with open("generated/irs.ir", "r") as f:
-        extern = None
-        for l in f:
-            # define signext i8 @add__char__char__char(i8 signext, i8 signext) #0 {
-            l = l.strip()
-            if (l.endswith("{")):
-                extern = []
-                m = re.search("@([^(]+)", l)
-                extern_name = m.group(1)
-        
-            if (extern is not None):
-                extern.append(l)
-        
-            if (l.endswith("}")):
-                all_externs[extern_name] = extern
-                extern = None
-
+    # Regenerate if they don't exist or same or older than this python file
+    if (not os.path.exists(generated_ir_filepath) or
+        (os.path.getmtime(generated_ir_filepath) <= os.path.getmtime(__file__))):
+        precompile_c_snippets(generated_c_filepath, generated_ir_filepath)
+    
+    all_externs = load_functions_ir(generated_ir_filepath)
+    
     llvm_ir = []
     function_signatures = []
     function_externs = set()
@@ -839,11 +1136,16 @@ def epycc_compile(source):
             function_externs.update(sym.ir.externs)
 
             # Dump this function's IR
-            # define dso_local float @fadd(float, float) #0 {
-            llvm_ir.append("define dso_local %s @%s(%s) {" % (
+            #   define dso_local zeroext i16  @add__int__int__short(i32, i16 zeroext) {
+            # LLVM type extension goes first in function return value, last on function parameters
+            llvm_ir.append("define dso_local %s %s @%s(%s) {" % (
+                get_llvm_type_ext(sym.value_type),
                 get_llvm_type(sym.value_type),
                 sym.name,
-                string.join([get_llvm_type(parameter.value_type) for parameter in sym.parameters], ",")
+                string.join([
+                    
+                    ("%s %s" % (get_llvm_type(parameter.value_type), get_llvm_type_ext(parameter.value_type)))
+                    for parameter in sym.parameters], ",")
             ))
 
             for l in sym.ir.value:
@@ -871,17 +1173,24 @@ def epycc_compile(source):
 
     llvm_ir = string.join(llvm_ir, "\n")
 
+    return llvm_ir, function_signatures
+
+
+def epycc_compile(source):
+    # XXX This does reinitialization when called multiple times and causes 
+    #     warnings like 
+    #       :for the -x86-asm-syntax option: may only occur zero or one times!
+    #     Do proper tear down or return some kind of singleton
+
+    llvm_ir, function_signatures = epycc_generate(source)
     lib = llvm_compile(llvm_ir, function_signatures)
 
     return lib
 
-if (__name__ == "__main__"):
-    
-    if (not os.path.exists("generated/irs.ir")):
-        print "Precompiling C snippets"
-        precompile_c_snippets()
 
-    source = open("tests/ops.c").read()
+
+if (__name__ == "__main__"):
+    source = open("tests/cfiles/ops.c").read()
 
     lib = epycc_compile(source)
     print lib.ir

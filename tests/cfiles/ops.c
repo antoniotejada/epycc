@@ -17,3 +17,7 @@ float fgte(float a, float b) {
 float f2pow2(int a) {
     return 2.0f * (a * a);
 }
+
+signed char fcast(int a) {
+    return (unsigned int) a;
+}
