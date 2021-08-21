@@ -90,6 +90,68 @@ binop_sign_to_name = { binop_sign : binop_name for binop_sign, binop_name in bin
 
 # XXX Missing memory operators * . -> &
 
+
+class SymbolTable():
+    
+    def __init__(self):
+        # Array of scopes, one dict per scope, plus one overflow dict
+
+        # The overflow dict is used to store function parameters from the time
+        # they are found at function definition time to the time the function's
+        # main block is found and the overflow becomes the current scope
+        # Then the overflow becomes the current block and parameters share the
+        # same scope as the function's top-level local variables.
+
+        # Parameters have to be at the same scope as the functions' local vars
+        # and local vars that redefined them will cause error (but you can 
+        # redefine them in a nested scope)
+        self.scope_symbols = [dict(), dict()]
+
+
+    def __getitem__(self, key):
+        item = None
+        # Search the item in all the scopes, except for overflow
+        for symbols in reversed(self.scope_symbols[:-1]):
+            item = symbols.get(key, None)
+            if (item is not None):
+                break
+            
+        return item
+
+    def __setitem__(self, key, value):
+        self.scope_symbols[-2][key] = value 
+
+    def __iter__(self):
+        return self.scope_symbols[-2].__iter__()
+
+    def __len__(self):
+        return len(self.scope_symbols) - 1
+
+    def values(self):
+        return self.scope_symbols[-2].values()
+
+    def get_overflow_item(self, key):
+        # Overflow should only be read from when the symbol table is at global
+        # scope
+        assert len(self) == 1, "Getting overflow items on a local scope!!!"
+        return self.scope_symbols[-1][key]
+
+    def set_overflow_item(self, key, value):
+        # Overflow should only be write to when the symbol table is at global
+        # scope
+        assert len(self) == 1, "Setting overflow items on a local scope!!!"
+        self.scope_symbols[-1][key] = value
+
+    def push_scope(self):
+        # The overflow now becomes the current and a new oveflow is created
+        self.scope_symbols.append(dict())
+
+    def pop_scope(self):
+        self.scope_symbols.pop()
+        # Clear the new overflow
+        self.scope_symbols[-1] = dict()
+
+
 def get_fn_name(*args):
     """
     Return a function name based on the incoming arguments: operation name, 
@@ -495,7 +557,7 @@ def generate_ir(generator, node):
         """
 
         if (a.type == "identifier"):
-            a = generator.symbol_table[-2][a.value]
+            a = generator.symbol_table[a.value]
             # Allocate a register and store if this symbol doesn't have one
             # yet
             if (not hasattr(a, "value_reg")):
@@ -608,7 +670,7 @@ def generate_ir(generator, node):
                 string.join(get_tree_tokens(node.children[0]), " "), 
                 get_grandson(node, (1, 0, 0, 0, 0)).value
             )
-            generator.symbol_table[-2][function_name] = Struct(type = "function", name=function_name, value_type=function_type)
+            generator.symbol_table[function_name] = Struct(type = "function", name=function_name, value_type=function_type)
             
             # Reset the register allocator index on every new function Looks
             # like LLVM IR requires the n function parameters take the first n
@@ -623,7 +685,7 @@ def generate_ir(generator, node):
             generator.current_register = 1
 
         elif (node.data == "compound_statement"):
-            generator.symbol_table.append({})
+            generator.symbol_table.push_scope()
 
         #
         # in order visit
@@ -771,7 +833,6 @@ def generate_ir(generator, node):
         elif (node.data == "parameter_declaration"):
             # ['float', 'a']
             parameter_type, parameter_name = gen_node
-            # Parameters go into the overflow table
             parameter = Struct(
                 type="variable", 
                 name=parameter_name.value, 
@@ -779,16 +840,15 @@ def generate_ir(generator, node):
                 # LLVM needs a gap of 1 between parameters and local vars
                 value_reg=generator.current_register - 1
             )
-            generator.symbol_table[-1][parameter_name.value] = parameter
+            
+            generator.symbol_table.set_overflow_item(parameter_name.value, parameter)
             generator.current_register += 1
 
             gen_node = parameter
             
         elif (node.data == "compound_statement"):
-            generator.symbol_table.pop()
-            # Clear the overflow table
-            generator.symbol_table[-1] = {}
-
+            generator.symbol_table.pop_scope()
+            
         elif (node.data == "integer_constant"):
             # XXX Check non decimal encoding (hex, oct)
             value = node.children[0]
@@ -829,7 +889,7 @@ def generate_ir(generator, node):
             gen_node = Struct(type="identifier", value=node.children[0].value)
 
         elif (node.data == "function_definition"):
-            fn = generator.symbol_table[-2][function_name]
+            fn = generator.symbol_table[function_name]
             fn.parameters = []
             
             # Collect parameters, note they could be empty or just one
@@ -904,7 +964,7 @@ def generate_ir(generator, node):
                 for value in fn.ir.value
             ]
                 
-            gen_node = generator.symbol_table[-2][function_name]
+            gen_node = generator.symbol_table[function_name]
         
     elif (isinstance(node, lark.Token)):
         gen_node = node.value
@@ -1112,7 +1172,7 @@ def epycc_generate(source):
 
     # XXX Do a proper symbol table with multi-level lookup (each level is a different
     #     scope)
-    generator = Struct(symbol_table=[{}, {}], current_register = 0)
+    generator = Struct(symbol_table = SymbolTable(), current_register = 0)
     irs = generate_ir(generator, tree)
 
     epycc_dirpath = os.path.dirname(os.path.abspath(__file__))
@@ -1129,7 +1189,8 @@ def epycc_generate(source):
     llvm_ir = []
     function_signatures = []
     function_externs = set()
-    for sym in generator.symbol_table[0].values():
+    assert len(generator.symbol_table) == 1, "Symbol table is not at global scope!!!"
+    for sym in generator.symbol_table.values():
         if (sym.type == "function"):
             
             # Collect externs
