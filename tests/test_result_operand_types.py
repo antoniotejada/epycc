@@ -19,6 +19,8 @@ import test_cfiles
 # Some of the tests have benign mismatches, decorate the function names with the
 # expected number of mismatches so test_single_cfile doesn't assert when it
 # finds them
+# This has 28 differences wrt clang mainly due to parameter ordering when using
+# _Bool. There are also some other differences that look benign.
 expected_mismatch_counts = {
     "test_add___Bool__char___Bool" : 4,
     "test_add___Bool__unsigned_char__short" : 2,
@@ -96,9 +98,4 @@ if (ignore_existing_files or (not os.path.exists(test_filepath)) or
     with open(test_filepath, "w") as f:
         f.writelines(l)
 
-mismatch_count = test_cfiles.test_single_cfile(test_filepath, ignore_existing_files) 
-
-# This has 28 differences wrt clang mainly due to parameter ordering when using
-# _Bool. There are also some other differences that look benign.
-# XXX This should be removed if the epycc-generated IR is used as gold?
-assert(mismatch_count == 28)
+unexpected_mismatch_count = test_cfiles.test_single_cfile(test_filepath, ignore_existing_files) 
