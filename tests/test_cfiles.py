@@ -95,6 +95,31 @@ epycc
     }
 
 
+'%6 = add i32 %5, %4' vs '%6 = add i32 %4, %5'
+
+clang
+
+    define dso_local float @bitwise_ops(i32, i32) local_unnamed_addr #0 {
+        %3 = and i32 %0, 65535
+        %4 = or i32 %1, 255
+        %5 = xor i32 %3, 1
+        %6 = add i32 %5, %4
+        %7 = uitofp i32 %6 to float
+        ret float %7
+    }
+
+epycc
+
+    define dso_local float @bitwise_ops(i32, i32) local_unnamed_addr #0 {
+        %3 = and i32 %0, 65535
+        %4 = or i32 %1, 255
+        %5 = xor i32 %3, 1
+        %6 = add i32 %4, %5
+        %7 = uitofp i32 %6 to float
+        ret float %7
+    }
+
+
 Different operations
 ~~~~~~~~~~~~~~~~~~~~
 
@@ -193,6 +218,7 @@ epycc
 
 """
 import os
+import re
 import string
 import sys
 import time
@@ -258,7 +284,7 @@ def test_single_cfile(test_filepath, ignore_existing_files=False):
     gold_ir = epycc.load_functions_ir(gold_optimized_ir_filepath)
 
     # Analyze line by line for mismatches between gold and test IR files
-    mismatch_count = 0
+    unexpected_mismatch_count = 0
     test_count = 0
     # Start with the gold IR since if the gold IR was generated with clang, it will
     # not contain all the helper functions the test IR does contain (and which don't
@@ -268,19 +294,35 @@ def test_single_cfile(test_filepath, ignore_existing_files=False):
         #     doesn't
         ## print "Checking", fn_name
         test_count += 1
+        function_mismatch_count = 0
+        mismatches = []
         for l_epycc, l_gold in zip(epycc_ir[fn_name][1:], gold_ir[fn_name][1:]):
             if (l_gold != l_epycc):
-                print "Found mismatch in", fn_name,":", repr(l_gold), "vs",  repr(l_epycc)
-                print "gold"
-                print string.join(gold_ir[fn_name], "\n")
-                print "epycc"
-                print string.join(epycc_ir[fn_name], "\n")
-                mismatch_count += 1
-                break
+                function_mismatch_count += 1
+                mismatches.append([l_gold, l_epycc])
         
-    print "Ran", test_count, "tests, found", mismatch_count, "mismatches"
+        # Get expected mismatch count from function name
+        # XXX Use epycc parsing and get this from pragmas or such?
+        m = re.match(r".*__mm(\d+)", fn_name)
+        expected_function_mismatch_count = 0
+        if (m is not None):
+            expected_function_mismatch_count = int(m.group(1))
 
-    return mismatch_count
+        if (expected_function_mismatch_count != function_mismatch_count):
+            print "Expected",expected_function_mismatch_count, "mismatches but found", function_mismatch_count, "in", fn_name,":"
+            for mismatch in mismatches:
+                l_gold, l_epycc = mismatch
+                print repr(l_gold), "vs",  repr(l_epycc)
+            print "gold"
+            print string.join(gold_ir[fn_name], "\n")
+            print "epycc"
+            print string.join(epycc_ir[fn_name], "\n")
+
+        unexpected_mismatch_count += (function_mismatch_count - expected_function_mismatch_count)
+
+    print "Ran", test_count, "tests, found", unexpected_mismatch_count, "unexpected mismatches"
+
+    return unexpected_mismatch_count
 
 
 if (__name__ == "__main__"):
@@ -292,5 +334,5 @@ if (__name__ == "__main__"):
             if (test_filename.endswith(".c")):
                 test_filepath = os.path.join(dirpath, test_filename)
 
-                mismatch_count = test_single_cfile(test_filepath, ignore_existing_files) 
-                assert(mismatch_count == 0)
+                unexpected_mismatch_count = test_single_cfile(test_filepath, ignore_existing_files)
+                assert(unexpected_mismatch_count == 0)

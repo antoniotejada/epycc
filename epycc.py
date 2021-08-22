@@ -56,10 +56,19 @@ binops = unpack_op_sign_names([
     "&&:and", "||:or",
 ])
 
-# XXX Missing post-pre incr
-prepostops = [ "++", "--" ]
-
 unops = unpack_op_sign_names(["+:add", "-:sub", "~:bitnot", "!:not"])
+
+int_ops = set(["|", "&", "^", "%", "<<", ">>", "!", "~"])
+rel_ops = set(["<", "<=", ">", ">=","==", "!="])
+logic_ops = set(["&&", "||"])
+ass_ops = set(["=", "*=", "/=", "%=", "+=", "-=", "<<=", ">>=", "&=", "^=", "|="])
+incr_ops = set([ "++", "--" ])
+
+binop_sign_to_name = { binop_sign : binop_name for binop_sign, binop_name in binops }
+
+# XXX Missing memory operators * . -> &
+# XXX Missing conditional operator ? :
+
 
 unspecified_integer_types = set(["_Bool", "char", "short", "int", "long", "long long"])
 float_types = set(["float", "double", "long double"])
@@ -80,15 +89,8 @@ unsigned_integer_types = set(["_Bool"] + [integer_type for integer_type in integ
 signed_integer_types = integer_types - unsigned_integer_types
 
 # XXX Missing _Complex
-all_types = float_types | integer_types
-
-int_ops = set(["|", "&", "^", "%", "<<", ">>", "!", "~"])
-rel_ops = set(["<", "<=", ">", ">=","==", "!="])
-logic_ops = set(["&&", "||"])
-
-binop_sign_to_name = { binop_sign : binop_name for binop_sign, binop_name in binops }
-
-# XXX Missing memory operators * . -> &
+non_void_types = float_types | integer_types
+all_types = float_types | integer_types | set(["void"])
 
 
 class SymbolTable():
@@ -216,6 +218,7 @@ def get_llvm_type(t):
         "signed char" : "i8",
         "unsigned char" : "i8",
         "_Bool" : "i1",
+        "void" : "void",
     }
     # Make sure we are covering all types
     assert all((c_type in all_types) for c_type in c_to_irtypes)
@@ -247,6 +250,8 @@ def get_ctype(t):
         "signed char" : ctypes.c_byte,
         "unsigned char" : ctypes.c_ubyte,
         "_Bool" : ctypes.c_bool,
+        "void" : None,
+        # XXX Missing ctypes.c_voidp once pointers are supported
     }
     # Make sure we are covering specified types
     assert all((c_type in all_types) for c_type in c_to_ctypes)
@@ -294,7 +299,7 @@ def precompile_c_snippets(generated_c_filepath, generated_ir_filepath):
     #     operations anyway at codegen time?
             
     for unop_sign, unop_name in unops:
-        for c_type in all_types:
+        for c_type in non_void_types:
             if ((unop_sign in int_ops) and (c_type not in integer_types)):
                 continue
 
@@ -310,7 +315,7 @@ def precompile_c_snippets(generated_c_filepath, generated_ir_filepath):
             l.append(fn + "\n")
 
     for binop_sign, binop_name in binops:
-        for c_type in all_types:
+        for c_type in non_void_types:
             # Don't do integer-only operations (bitwise, mod) on non-integer
             # operands
             if ((binop_sign in int_ops) and (c_type not in integer_types)):
@@ -330,8 +335,8 @@ def precompile_c_snippets(generated_c_filepath, generated_ir_filepath):
             # Assignment operators will be done as a = a + b
                 
     # Build the type conversion functions
-    for res_type in all_types:
-        for a_type in all_types:
+    for res_type in non_void_types:
+        for a_type in non_void_types:
             # No need to generate for the same type (but note the table is still
             # redundant for integer types since it contains eg signed int to int)
             if (a_type != res_type):
@@ -449,8 +454,8 @@ def generate_ir(generator, node):
             "_Bool" : 0,
         }
         # Make sure we are covering all specified types
-        assert all((c_type in all_types) for c_type in type_ranks)
-        assert all((c_type in type_ranks) for c_type in all_types)
+        assert all((c_type in non_void_types) for c_type in type_ranks)
+        assert all((c_type in type_ranks) for c_type in non_void_types)
         
         def get_ranked_types(a_type, b_type):
             a_type_rank = type_ranks[a_type]
@@ -548,6 +553,20 @@ def generate_ir(generator, node):
                 
         return res_type
 
+
+    def get_ref_reg_and_type(a, irs, externs):
+        # XXX This is wrong in the case of lvalues of complex expressions 
+        #     (pointers, arrays, structs...)
+        
+        # Get reg and type to deal with allocations
+        get_reg_and_type(a, irs, externs)
+
+        a = generator.symbol_table[a.value]
+        assert a.type == "variable"
+
+        return a.value_ref, a.value_reg, a.value_type
+
+
     def get_reg_and_type(a, irs, externs):
         """
         Get reg and type for a given source or destination operand
@@ -558,16 +577,35 @@ def generate_ir(generator, node):
 
         if (a.type == "identifier"):
             a = generator.symbol_table[a.value]
-            # Allocate a register and store if this symbol doesn't have one
-            # yet
-            if (not hasattr(a, "value_reg")):
-                a.value_reg = generator.current_register
-                generator.current_register += 1
+            a_type = a.value_type
+            a_llvm_type = get_llvm_type(a_type)
 
-                irs.append("%%%d = alloca %s, align 4" % (a.value_reg, get_llvm_type(a.value_type)))
+            # l-values need storage to store the value, allocate it if it doesn't
+            # have one already
+            if (not hasattr(a, "value_ref")):
+                a.value_ref = generator.current_register
+                generator.current_register += 1
+                # "%3 = alloca i32, align 4"
+                irs.append("%%%d = alloca %s, align 4" % (a.value_ref, a_llvm_type))
+
+                # If it has a register it means that it has an initial value, 
+                # copy from the register into the storage
+                if (hasattr(a, "value_reg")):
+                    # "store i32 %0, i32* %3, align 4"
+                    irs.append("store %s %%%d, %s* %%%d, align 4" % (a_llvm_type, a.value_reg, a_llvm_type, a.value_ref))
+
+            # Load from the storage to a new register to make sure the register
+            # value we use is uptodate
+            # XXX This is probably overkill, we should be able to track when the
+            #     existing register holding the value is uptodate?
+            a.value_reg = generator.current_register
+            generator.current_register += 1
+            # "%5 = load i32, i32* %4, align 4"
+            irs.append("%%%d = load %s, %s* %%%d, align 4" % (a.value_reg, a_llvm_type, a_llvm_type, a.value_ref))
+            
 
             a_reg = a.value_reg
-            a_type = a.value_type
+            
 
         elif (a.type == "constant"):
             # IR can operate on constants directly but allocating a register and
@@ -622,7 +660,7 @@ def generate_ir(generator, node):
 
         return a_reg, a_type
 
-    def generate_ir_call(generator, irs, externs, fn_name, res_type, type_reg_list):
+    def generate_call_ir(generator, irs, externs, fn_name, res_type, type_reg_list):
         """
         Generates IR for the given call and the result type, with arguments type
         and registers in type_reg_list
@@ -642,7 +680,98 @@ def generate_ir(generator, node):
         externs.add(fn_name)
 
         return res_reg
-    
+
+    def detach_ir(a, irs, externs):
+        if (a.type == "ir"):
+            irs.extend(a.value)
+            externs.update(a.externs)
+
+            a.value = []
+            a.externs = set()
+
+    def generate_assign_ir(generator, a, b):
+        irs = []
+        externs = set()
+
+        # We need to make sure the IRs for a and b are always generated before
+        # the assign or the type conversion, since they could contain stores,
+        # etc needed for the conversions
+        # XXX This should go away once IR is stored in a global place with a builder
+        detach_ir(a, irs, externs)
+        detach_ir(b, irs, externs)
+
+        a_ref, a_reg, a_type = get_ref_reg_and_type(a, irs, externs)
+        b_reg, b_type = get_reg_and_type(b, irs, externs)
+
+        # Return the value in case it's used as part of an expression
+        res_type = a_type
+        res_reg = b_reg
+        
+        # Convert the input type to the result type
+        if (b_type != res_type):
+            b_reg = generate_call_ir(generator, irs, externs, 
+                get_fn_name("cnv", res_type, b_type), res_type, [b_type, b_reg])
+
+        a_llvm_type = get_llvm_type(a_type)
+        
+        # Perform the store
+        # "store i32 %0, i32* %3, align 4"
+        irs.append("store %s %%%d, %s* %%%d, align 4" % (a_llvm_type, b_reg, a_llvm_type, a_ref))
+
+        gen_node = Struct(type="ir", value_type=res_type, value_reg = res_reg, value=irs, externs=externs)
+
+        return gen_node
+
+
+    def generate_binop_ir(generator, a, b, op_sign):
+        irs = []
+        externs = set()
+
+        # We need to make sure the IRs for a and b are always generated before
+        # the assign or the type conversion, since they could contain stores,
+        # etc needed for the conversions
+        # XXX This should go away once IR is stored in a global place with a builder
+        detach_ir(a, irs, externs)
+        detach_ir(b, irs, externs)
+
+        # Call the precompiled C function for this expression (these calls
+        # are not a performance issue, since they were verified be inlined
+        # and optimized in LLVM optimize mode).
+        
+        # This could be done more elegantly with llvmlite's IR builder but
+        # the precompiled function takes care of C-compliant sign
+        # extension/truncation of operands and result
+
+        # XXX Investigate using the builder in two steps, first converting
+        #     the types, then performing the operation, is very error prone
+        #     wrt C compliance
+        # XXX Another option is to use the builder and then precompile only
+        #     data conversion functions.
+        # XXX Yet another option which reduces the number of precompiled
+        #     functions is to precompile same-argument operation functions
+        #     and then data conversion functions.
+        a_reg, a_type = get_reg_and_type(a, irs, externs)
+        b_reg, b_type = get_reg_and_type(b, irs, externs)
+        res_type = get_result_type(op_sign, a_type, b_type)
+
+        # Convert the input types to the result type
+        if (a_type != res_type):
+            a_reg = generate_call_ir(generator, irs, externs,
+                get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_reg])
+            
+        if (b_type != res_type):
+            b_reg = generate_call_ir(generator, irs, externs, 
+                get_fn_name("cnv", res_type, b_type), res_type, [b_type, b_reg])
+
+        # Perform the operation in res_type
+        fn_name = get_fn_name(binop_sign_to_name[op_sign], res_type, res_type, res_type)
+        res_reg = generate_call_ir(generator, irs, externs, fn_name, 
+            res_type, [res_type, a_reg, res_type, b_reg])
+
+        gen_node = Struct(type="ir", value_type=res_type, value_reg = res_reg, value=irs, externs=externs)
+
+        return gen_node
+
 
     gen_node = None
     # Node can be Token or Tree
@@ -691,9 +820,14 @@ def generate_ir(generator, node):
         # in order visit
         #
 
-        if (len(node.children) == 1):
+        if ((len(node.children) == 1) and (node.data not in ["init_declarator", "init_declarator_list"])):
+            # XXX This catch all should go at some point?
+            # XXX This is cumbersome because sometimes we want to always receive
+            #     a list to unify handling, on the other hand creating a one 
+            #     element list here would do nesting, but it's also convenient
+            # XXX Ideally we should handle all nodes individually without catch-all
             gen_node = generate_ir(generator, node.children[0])
-
+                
         else:
             # XXX When there's more than one child we need to special case some
             #     of the rules so we avoid returning too much nesting or long
@@ -712,7 +846,7 @@ def generate_ir(generator, node):
                 gen_node = [
                     generate_ir(generator, node.children[1]),
                     generate_ir(generator, node.children[3])
-                ]
+                ]    
 
             elif (node.data == "expression_statement"):
                 # expression_statement:  expression? ";"
@@ -731,6 +865,81 @@ def generate_ir(generator, node):
                 assert (len(node.children) == 3)
                 gen_node = generate_ir(generator, node.children[1])
 
+            elif (node.data == "init_declarator_list"):
+                # init_declarator_list:  init_declarator
+                # |  init_declarator_list "," init_declarator 
+                # Skip the commas, pass the rest
+                
+                if (len(node.children) == 1):
+                    gen_node = [generate_ir(generator, node.children[0])]
+                else:
+                    gen_node = generate_ir(generator, node.children[0])
+                    gen_node.append(generate_ir(generator, node.children[2]))
+                    
+
+            elif (node.data == "init_declarator"):
+                # declarator contains one identifier and one or none initializers
+                # init_declarator:  declarator
+                # |  declarator "=" initializer
+                identifier = get_tree_tokens(node.children[0])[0]
+                initializer = None
+                if (len(node.children) > 1):
+                    initializer = generate_ir(generator, node.children[2])
+                gen_node = [identifier, initializer]
+
+            elif (node.data == "declaration"):
+                # declaration contains one type and one or more identifiers and or
+                # initializerss
+                # declaration:  declaration_specifiers init_declarator_list? ";"
+
+                # XXX Right now all variables are allocated on the stack, globals
+                #     not supported
+                assert (len(generator.symbol_table) > 1), "Global variables not supported yet!"
+                
+                # The declarator list may contain initializer so it needs
+                # generating
+                if (len(node.children) > 1):
+                    gen_node = generate_ir(generator, node.children[1])
+                    
+                # Register the variable and create an IR node to hold the
+                # initializer, if any
+                irs = []
+                externs = set()
+                decl_type = get_tree_tokens(node.children[0])[0]
+                for identifier, initializer in gen_node:
+                    variable = Struct(
+                        type="variable", 
+                        name=identifier, 
+                        value_type=decl_type,
+                        # Value_reg and value_ref will be assigned on usage
+                    )
+                    generator.symbol_table[identifier] = variable
+                    if (initializer is not None):
+                        # XXX This should come from gen_node instead of having
+                        #     to recreate it here?
+                        a = Struct(type="identifier", value=identifier)
+                        b = initializer
+
+                        # XXX This is a copy-paste of the operation, refactor
+
+                        a_ref, a_reg, a_type = get_ref_reg_and_type(a, irs, externs)
+                        b_reg, b_type = get_reg_and_type(b, irs, externs)
+
+                        res_type = a_type
+
+                        # Convert the input type to the result type
+                        if (b_type != res_type):
+                            b_reg = generate_call_ir(generator, irs, externs, 
+                                get_fn_name("cnv", res_type, b_type), res_type, [b_type, b_reg])
+
+                        a_llvm_type = get_llvm_type(a_type)
+                        
+                        # Perform the store
+                        # "store i32 %0, i32* %3, align 4"
+                        irs.append("store %s %%%d, %s* %%%d, align 4" % (a_llvm_type, b_reg, a_llvm_type, a_ref))    
+                        
+                gen_node = Struct(type="ir", value_type="void", value_reg=None, value=irs, externs=externs)
+
             elif (node.data == "parameter_list"):
                 # parameter_list:  parameter_declaration 
                 #   |  parameter_list "," parameter_declaration
@@ -740,7 +949,18 @@ def generate_ir(generator, node):
                 gen_node = [generate_ir(generator, node.children[0])]
                 if (len(node.children) > 1):
                     gen_node.append(generate_ir(generator, node.children[2]))
-                
+
+            elif (node.data == "block_item_list"):
+                # block_item_list:  block_item
+                # |  block_item_list block_item
+                gen_node = generate_ir(generator, node.children[0])
+                if (len(node.children) > 1):
+                    # Merge blocks into a single ir node
+                    prev_node = gen_node
+                    gen_node = generate_ir(generator, node.children[1])
+                    gen_node.value = prev_node.value + gen_node.value
+                    gen_node.externs.update(prev_node.externs)
+
             else:
                 gen_node = []
                 for child in node.children:
@@ -779,7 +999,7 @@ def generate_ir(generator, node):
             a_reg, a_type = get_reg_and_type(gen_node, irs, externs)
             
             if ((res_type is not None) and (res_type != a_type)):
-                res_reg = generate_ir_call(generator, irs, externs,
+                res_reg = generate_call_ir(generator, irs, externs,
                     get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_reg])
             else:
                 res_reg = a_reg
@@ -791,44 +1011,16 @@ def generate_ir(generator, node):
             
             a, op_sign, b = gen_node
 
-            irs = []
-            externs = set()
-
-            # Call the precompiled C function for this expression (these calls
-            # are not a performance issue, since they were verified be inlined
-            # and optimized in LLVM optimize mode).
-            
-            # This could be done more elegantly with llvmlite's IR builder but
-            # the precompiled function takes care of C-compliant sign
-            # extension/truncation of operands and result
-
-            # XXX Investigate using the builder in two steps, first converting
-            #     the types, then performing the operation, is very error prone
-            #     wrt C compliance
-            # XXX Another option is to use the builder and then precompile only
-            #     data conversion functions.
-            # XXX Yet another option which reduces the number of precompiled
-            #     functions is to precompile same-argument operation functions
-            #     and then data conversion functions.
-            a_reg, a_type = get_reg_and_type(a, irs, externs)
-            b_reg, b_type = get_reg_and_type(b, irs, externs)
-            res_type = get_result_type(op_sign, a_type, b_type)
-
-            # Convert the input types to the result type
-            if (a_type != res_type):
-                a_reg = generate_ir_call(generator, irs, externs,
-                    get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_reg])
+            if (op_sign in ass_ops):
+                if (len(op_sign) > 1):
+                    # assing + operation, generate "a += b" as "a = a + b"
+                    b = generate_binop_ir(generator, a, b, op_sign[:-1])
+                    
+                gen_node = generate_assign_ir(generator, a, b)
                 
-            if (b_type != res_type):
-                b_reg = generate_ir_call(generator, irs, externs, 
-                    get_fn_name("cnv", res_type, b_type), res_type, [b_type, b_reg])
+            else:
 
-            # Perform the operation in res_type
-            fn_name = get_fn_name(binop_sign_to_name[op_sign], res_type, res_type, res_type)
-            res_reg = generate_ir_call(generator, irs, externs, fn_name, 
-                res_type, [res_type, a_reg, res_type, b_reg])
-
-            gen_node = Struct(type="ir", value_type=res_type, value_reg = res_reg, value=irs, externs=externs)
+                gen_node = generate_binop_ir(generator, a, b, op_sign)
 
         elif (node.data == "parameter_declaration"):
             # ['float', 'a']
@@ -904,7 +1096,11 @@ def generate_ir(generator, node):
                         parameters.append(parameter_node)
                         
             fn.parameters = parameters
-            fn.ir = gen_node[2]
+            if (gen_node[2] == "}"):
+                # Empty function
+                fn.ir = Struct(type="ir", value_type="void", value_reg=None, value=[], externs=set())
+            else:
+                fn.ir = gen_node[2]
 
             # If the return type is different from the block type, convert
             if (fn.value_type != fn.ir.value_type):
@@ -913,7 +1109,7 @@ def generate_ir(generator, node):
                 res_type = fn.value_type
                 irs = fn.ir.value
                 externs = fn.ir.externs
-                res_reg = generate_ir_call(generator, irs, externs,
+                res_reg = generate_call_ir(generator, irs, externs,
                     get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_reg])
         
                 fn.ir = Struct(type="ir", value_type=res_type, value_reg=res_reg, value=irs, externs=externs)
@@ -1135,7 +1331,7 @@ def load_functions_ir(ir_filepath):
     return ir_functions
 
 
-def epycc_generate(source):
+def epycc_generate(source, debug = False):
     # XXX check if we can tag which tokens to keep with "!" in the rule instead 
     #     of keep_all_tokens
 
@@ -1168,7 +1364,8 @@ def epycc_generate(source):
         lexer="standard")
     tree = parser.parse(source)
 
-    #print tree.pretty()
+    if (debug):
+        print tree.pretty()
 
     # XXX Do a proper symbol table with multi-level lookup (each level is a different
     #     scope)
@@ -1237,13 +1434,13 @@ def epycc_generate(source):
     return llvm_ir, function_signatures
 
 
-def epycc_compile(source):
+def epycc_compile(source, debug = False):
     # XXX This does reinitialization when called multiple times and causes 
     #     warnings like 
     #       :for the -x86-asm-syntax option: may only occur zero or one times!
     #     Do proper tear down or return some kind of singleton
 
-    llvm_ir, function_signatures = epycc_generate(source)
+    llvm_ir, function_signatures = epycc_generate(source, debug)
     lib = llvm_compile(llvm_ir, function_signatures)
 
     return lib
@@ -1251,9 +1448,9 @@ def epycc_compile(source):
 
 
 if (__name__ == "__main__"):
-    source = open("tests/cfiles/ops.c").read()
+    source = open("samples/current.c").read()
 
-    lib = epycc_compile(source)
+    lib = epycc_compile(source, True)
     print lib.ir
     print lib.ir_optimized
     #print lib.asm
