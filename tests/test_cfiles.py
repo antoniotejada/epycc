@@ -235,12 +235,12 @@ def test_single_cfile(test_filepath, ignore_existing_files=False):
     gold_dir = os.path.join(epycc_dirpath, "_out")
 
     _, test_filename = os.path.split(test_filepath)
-    test_ir_filepath = os.path.join(out_dir, test_filename + ".ir")
-    test_optimized_ir_filepath = os.path.join(out_dir, test_filename + ".optimized.ir")
+    test_ir_filepath = os.path.join(out_dir, test_filename + ".ll")
+    test_optimized_ir_filepath = os.path.join(out_dir, test_filename + ".optimized.ll")
 
     gold_filename = "gold_" + test_filename
-    gold_ir_filepath = os.path.join(gold_dir, gold_filename + ".ir")
-    gold_optimized_ir_filepath = os.path.join(gold_dir, gold_filename + ".optimized.ir")
+    gold_ir_filepath = os.path.join(gold_dir, gold_filename + ".ll")
+    gold_optimized_ir_filepath = os.path.join(gold_dir, gold_filename + ".optimized.ll")
 
     #  If the gold IR file already exists, no need to generate it from clang
     if (ignore_existing_files or (not os.path.exists(gold_optimized_ir_filepath)) or 

@@ -10,6 +10,16 @@ float fadd(float a, float b) {
     return a + b;
 }
 
+float fmul(float a, float b) {
+    return a * b;
+}
+
+// Three mismatches expected, epycc generates a phi select node, clang generates
+// or and one instruction more
+float flor__mm3(float a, float b) {
+    return a || b;
+}
+
 float fdouble(float a) {
     return 2.0f * a;
 }
@@ -25,3 +35,4 @@ float f2pow2(int a) {
 signed char fcast(int a) {
     return (unsigned int) a;
 }
+

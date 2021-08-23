@@ -197,7 +197,7 @@ def get_llvm_type(t):
     # XXX Calling this on every IR generation is error prone, should we 
     #     store this type in the symbol and have get_llvm_result_type, etc?
     #     Or just keep the llvm type around?
-    c_to_irtypes = {
+    c_to_llvm_types = {
         "long double" : "x86_fp80",
         "double" : "double",
         "float" : "float",
@@ -221,10 +221,11 @@ def get_llvm_type(t):
         "void" : "void",
     }
     # Make sure we are covering all types
-    assert all((c_type in all_types) for c_type in c_to_irtypes)
-    assert all((c_type in c_to_irtypes) for c_type in all_types)
+    assert all((c_type in all_types) for c_type in c_to_llvm_types)
+    assert all((c_type in c_to_llvm_types) for c_type in all_types)
     
-    return c_to_irtypes[t]
+    return c_to_llvm_types[t]
+
         
 def get_ctype(t):
     """
@@ -778,222 +779,44 @@ def generate_ir(generator, node):
     if (type(node) is lark.Tree):
 
         #
-        # Before children visit actions
-        #
-
-        if (node.data == "function_definition"):
-            # function_definition
-            #   declaration_specifiers
-            #     type_specifier	float
-            #   declarator
-            #     direct_declarator
-            #       direct_declarator
-            #         identifier	fadd
-            # ['float', ['fadd', '(', [['float', 'a'], ',', ['float', 'b']], ')'], ['{', ['return', ['a', '+', 'b'], ';'], '}']]
-            function_type, function_name = (
-                # XXX This assumes the type is basic type
-                # XXX This should be done once declaration_specifiers are read,
-                #     but we need the function in the symbol table before the
-                #     compound statement is read for recursive functions and
-                #     with the type?
-                string.join(get_tree_tokens(node.children[0]), " "), 
-                get_grandson(node, (1, 0, 0, 0, 0)).value
-            )
-            generator.symbol_table[function_name] = Struct(type = "function", name=function_name, value_type=function_type)
-            
-            # Reset the register allocator index on every new function Looks
-            # like LLVM IR requires the n function parameters take the first n
-            # indices, then there's an empty index, and then the indices for the
-            # local variables (index 0 will be unused on functions with no
-            # parameters). To simplify that handling without having to pass the
-            # number of parameters from the function definition to the function
-            # block, which is cumbersome:
-            # - start the generator index at 1
-            # - have the parameters use index-1
-            # - have the local variables use index
-            generator.current_register = 1
-
-        elif (node.data == "compound_statement"):
-            generator.symbol_table.push_scope()
-
-        #
         # in order visit
         #
 
-        if ((len(node.children) == 1) and (node.data not in ["init_declarator", "init_declarator_list"])):
-            # XXX This catch all should go at some point?
-            # XXX This is cumbersome because sometimes we want to always receive
-            #     a list to unify handling, on the other hand creating a one 
-            #     element list here would do nesting, but it's also convenient
-            # XXX Ideally we should handle all nodes individually without catch-all
-            gen_node = generate_ir(generator, node.children[0])
-                
-        else:
-            # XXX When there's more than one child we need to special case some
-            #     of the rules so we avoid returning too much nesting or long
-            #     lists that make things down the line  harder or
-            #     undeterministic (recursive productions with the depth
-            #     depending on the length of lists). 
-            #     Is there a better way with some automated whitelist or lark 
-            #     facility that doesn't require touching the .lark file? or 
-            #     maybe it could be massaged at load time?
-            if (node.data == "compound_statement"):
-                # compound_statement:  "{" block_item_list? "}"
-                gen_node = generate_ir(generator, node.children[1])
+        # XXX When there's more than one child we need to special case some
+        #     of the rules so we avoid returning too much nesting or long
+        #     lists that make things down the line  harder or
+        #     undeterministic (recursive productions with the depth
+        #     depending on the length of lists). 
+        #     Is there a better way with some automated whitelist or lark 
+        #     facility that doesn't require touching the .lark file? or 
+        #     maybe it could be massaged at load time?
+        if (node.data == "compound_statement"):
+            # compound_statement:  "{" block_item_list? "}"
+            generator.symbol_table.push_scope()
+            gen_node = generate_ir(generator, node.children[1])
+            generator.symbol_table.pop_scope()
 
-            elif (node.data == "cast_expression"):
-                # cast_expression: ... |  "(" type_name ")" cast_expression
-                gen_node = [
-                    generate_ir(generator, node.children[1]),
-                    generate_ir(generator, node.children[3])
-                ]    
-
-            elif (node.data == "expression_statement"):
-                # expression_statement:  expression? ";"
-                if (len(node.children) > 1):
-                    gen_node = generate_ir(generator, node.children[0])
-
-            elif ((node.data == "jump_statement") and (node.children[0].value == "return")):
-                # jump_statement: ... | "return" expression? ";" | ...
-                if (len(node.children) > 2):
-                    gen_node = generate_ir(generator, node.children[1])
-
-            elif (node.data == "primary_expression"):
-                # primary_expression: ... | "(" expression ")" | ..
-                # The other primary expression rules go through the single-child 
-                # path
-                assert (len(node.children) == 3)
-                gen_node = generate_ir(generator, node.children[1])
-
-            elif (node.data == "init_declarator_list"):
-                # init_declarator_list:  init_declarator
-                # |  init_declarator_list "," init_declarator 
-                # Skip the commas, pass the rest
-                
-                if (len(node.children) == 1):
-                    gen_node = [generate_ir(generator, node.children[0])]
-                else:
-                    gen_node = generate_ir(generator, node.children[0])
-                    gen_node.append(generate_ir(generator, node.children[2]))
-                    
-
-            elif (node.data == "init_declarator"):
-                # declarator contains one identifier and one or none initializers
-                # init_declarator:  declarator
-                # |  declarator "=" initializer
-                identifier = get_tree_tokens(node.children[0])[0]
-                initializer = None
-                if (len(node.children) > 1):
-                    initializer = generate_ir(generator, node.children[2])
-                gen_node = [identifier, initializer]
-
-            elif (node.data == "declaration"):
-                # declaration contains one type and one or more identifiers and or
-                # initializerss
-                # declaration:  declaration_specifiers init_declarator_list? ";"
-
-                # XXX Right now all variables are allocated on the stack, globals
-                #     not supported
-                assert (len(generator.symbol_table) > 1), "Global variables not supported yet!"
-                
-                # The declarator list may contain initializer so it needs
-                # generating
-                if (len(node.children) > 1):
-                    gen_node = generate_ir(generator, node.children[1])
-                    
-                # Register the variable and create an IR node to hold the
-                # initializer, if any
-                irs = []
-                externs = set()
-                decl_type = get_tree_tokens(node.children[0])[0]
-                for identifier, initializer in gen_node:
-                    variable = Struct(
-                        type="variable", 
-                        name=identifier, 
-                        value_type=decl_type,
-                        # Value_reg and value_ref will be assigned on usage
-                    )
-                    generator.symbol_table[identifier] = variable
-                    if (initializer is not None):
-                        # XXX This should come from gen_node instead of having
-                        #     to recreate it here?
-                        a = Struct(type="identifier", value=identifier)
-                        b = initializer
-
-                        # XXX This is a copy-paste of the operation, refactor
-
-                        a_ref, a_reg, a_type = get_ref_reg_and_type(a, irs, externs)
-                        b_reg, b_type = get_reg_and_type(b, irs, externs)
-
-                        res_type = a_type
-
-                        # Convert the input type to the result type
-                        if (b_type != res_type):
-                            b_reg = generate_call_ir(generator, irs, externs, 
-                                get_fn_name("cnv", res_type, b_type), res_type, [b_type, b_reg])
-
-                        a_llvm_type = get_llvm_type(a_type)
-                        
-                        # Perform the store
-                        # "store i32 %0, i32* %3, align 4"
-                        irs.append("store %s %%%d, %s* %%%d, align 4" % (a_llvm_type, b_reg, a_llvm_type, a_ref))    
-                        
-                gen_node = Struct(type="ir", value_type="void", value_reg=None, value=irs, externs=externs)
-
-            elif (node.data == "parameter_list"):
-                # parameter_list:  parameter_declaration 
-                #   |  parameter_list "," parameter_declaration
-                # Remove extra nesting so the parameter list location is
-                # deterministic at parameter collection time in the function
-                # wrap-up
-                gen_node = [generate_ir(generator, node.children[0])]
-                if (len(node.children) > 1):
-                    gen_node.append(generate_ir(generator, node.children[2]))
-
-            elif (node.data == "block_item_list"):
-                # block_item_list:  block_item
-                # |  block_item_list block_item
-                gen_node = generate_ir(generator, node.children[0])
-                if (len(node.children) > 1):
-                    # Merge blocks into a single ir node
-                    prev_node = gen_node
-                    gen_node = generate_ir(generator, node.children[1])
-                    gen_node.value = prev_node.value + gen_node.value
-                    gen_node.externs.update(prev_node.externs)
-
-            else:
-                gen_node = []
-                for child in node.children:
-                    gen_node.append(generate_ir(generator, child))
-
-        #
-        # After children visit actions
-        #
-        
-        # trap any expression that hasn't been resolved to a single node
-        if ((node.data == "type_name") or (node.data == "declaration_specifiers")):
-            # XXX Right now assume there's only one type and it's one of the
-            #     basic types, once complex types are supported, the types will
-            #     have to be put in the symbol table and parsed properly
-            res_type = get_tree_tokens(node)
-            res_type = string.join(res_type, " ")
-            gen_node = res_type
-                
         elif (node.data == "cast_expression"):
+            # cast_expression:  unary_expression
+            #  |  "(" type_name ")" cast_expression
+
             # Always make sure expressions leave as IR nodes. 
             # This takes care of not pushing constants and identifiers up
             # XXX This could be done earlier in primary_expression
             # XXX This may make harder detecting constants upstream?
-            
-            # Convert to type if different, otherwise pass through making sure
-            # an IR node is created if necessary
-            if (isinstance(gen_node, list)):
+            if (len(node.children) > 1):
+                gen_node = [
+                    generate_ir(generator, node.children[1]),
+                    generate_ir(generator, node.children[3])
+                ]
                 # There's a cast operator, deal with it
                 res_type = gen_node[0]
                 gen_node = gen_node[1]
+
             else:
+                gen_node = generate_ir(generator, node.children[0])
                 res_type = None
-            
+
             irs = []
             externs = set()
             a_reg, a_type = get_reg_and_type(gen_node, irs, externs)
@@ -1007,9 +830,35 @@ def generate_ir(generator, node):
 
             gen_node = Struct(type="ir", value_type=res_type, value_reg=res_reg, value=irs, externs=externs)
 
-        elif (node.data.endswith("_expression") and isinstance(gen_node, list) and (len(gen_node) == 3)):
+        elif (node.data == "primary_expression"):
+            # primary_expression:  identifier
+            #   |  constant
+            #   |  string_literal
+            #   |  "(" expression ")"
+
+            if (len(node.children) > 1):
+                gen_node = generate_ir(generator, node.children[1])
+            else:
+                gen_node = generate_ir(generator, node.children[0])
+
+        elif (node.data.endswith("_expression") and (len(node.children) == 3)):
+            # Cach all two operands + sign expressions
+
+            # assignment_expression:  conditional_expression
+            #   |  unary_expression assignment_operator assignment_expression
+            # conditional_expression:  logical_or_expression
+            #   |  logical_or_expression "?" expression ":" conditional_expression
+            # ...
+            # multiplicative_expression:  cast_expression
+            #   |  multiplicative_expression "*" cast_expression
+            #   |  multiplicative_expression "/" cast_expression
+            #   |  multiplicative_expression "%" cast_expression
             
-            a, op_sign, b = gen_node
+            a, op_sign, b = (
+                generate_ir(generator, node.children[0]),
+                generate_ir(generator, node.children[1]),
+                generate_ir(generator, node.children[2]),
+            )
 
             if (op_sign in ass_ops):
                 if (len(op_sign) > 1):
@@ -1022,71 +871,69 @@ def generate_ir(generator, node):
 
                 gen_node = generate_binop_ir(generator, a, b, op_sign)
 
-        elif (node.data == "parameter_declaration"):
-            # ['float', 'a']
-            parameter_type, parameter_name = gen_node
-            parameter = Struct(
-                type="variable", 
-                name=parameter_name.value, 
-                value_type=parameter_type, 
-                # LLVM needs a gap of 1 between parameters and local vars
-                value_reg=generator.current_register - 1
-            )
+        elif (node.data == "expression_statement"):
+            # expression_statement:  expression? ";"
+            if (len(node.children) > 1):
+                gen_node = generate_ir(generator, node.children[0])
+
+        elif ((node.data == "jump_statement") and (node.children[0].value == "return")):
+            # jump_statement: ... | "return" expression? ";" | ...
+            if (len(node.children) > 2):
+                gen_node = generate_ir(generator, node.children[1])
             
-            generator.symbol_table.set_overflow_item(parameter_name.value, parameter)
-            generator.current_register += 1
-
-            gen_node = parameter
+        elif (node.data == "init_declarator_list"):
+            # init_declarator_list:  init_declarator
+            # |  init_declarator_list "," init_declarator 
+            # Skip the commas, pass the rest
             
-        elif (node.data == "compound_statement"):
-            generator.symbol_table.pop_scope()
-            
-        elif (node.data == "integer_constant"):
-            # XXX Check non decimal encoding (hex, oct)
-            value = node.children[0]
-            value_type = "int"
-            # Conservative suffix, may be smaller
-            suffix = value[-3:].upper()
-            value_len = len(value)
-            # Check type suffixes
-            if ("LL" in suffix):
-                value_type = "long long"
-                value_len -= 2
-            elif ("L" in suffix):
-                # Note LL was checked before, so checking one L here is safe
-                value_type = "long"
-                value_len -= 1
-            # Check sign suffix
-            if ("U" in suffix):
-                value_type = "unsigned " + value_type
-                value_len -= 1
-            value = int(value[:value_len])
-            
-            gen_node = Struct(type="constant", value_type=value_type, value=value)
-
-        elif (node.data == "floating_constant"):
-            float_type = "double"
-            value = node.children[0].value
-            if (value[-1] in ["f", "F"]):
-                float_type = "float"
-
-            if (value[-1] in ["f", "F", "L", "l"]):
-                value = value[:-1]
-
-            value = float(value)
-
-            gen_node = Struct(type="constant", value_type = float_type, value= value)
-
-        elif (node.data == "identifier"):
-            gen_node = Struct(type="identifier", value=node.children[0].value)
+            if (len(node.children) == 1):
+                gen_node = [generate_ir(generator, node.children[0])]
+            else:
+                gen_node = generate_ir(generator, node.children[0])
+                gen_node.append(generate_ir(generator, node.children[2]))
 
         elif (node.data == "function_definition"):
-            fn = generator.symbol_table[function_name]
-            fn.parameters = []
+            # function_definition:  declaration_specifiers declarator declaration_list? compound_statement
+            # function_definition
+            #   declaration_specifiers
+            #     type_specifier	double
+            #   declarator
+            #     direct_declarator
+            #       direct_declarator
+            #         identifier	params
+            #       (
+            #       parameter_type_list
+            #         parameter_list
+            #           parameter_list
+
+            # Read the name, return type and parameters so we put the
+            # function in the symbol table with full parameter and return
+            # type information before body is generated, in case function's
+            # body needs it eg because calls it recursively
             
+            
+            # Read return type
+            function_type = generate_ir(generator, node.children[0])
+            
+            # Reset the register allocator index on every new function Looks
+            # like LLVM IR requires the n function parameters take the first n
+            # indices, then there's an empty index, and then the indices for the
+            # local variables (index 0 will be unused on functions with no
+            # parameters). To simplify that handling without having to pass the
+            # number of parameters from the function definition to the function
+            # block, which is cumbersome:
+            # - start the generator index at 1
+            # - have the parameters use index-1
+            # - have the local variables use index
+            generator.current_register = 1
+            
+            # Read name and parameters
+            gen_node = generate_ir(generator, node.children[1])
+            function_name = gen_node[0].value
+
             # Collect parameters, note they could be empty or just one
             parameters = []
-            parameter_nodes = gen_node[1][2]
+            parameter_nodes = gen_node[2]
             if (parameter_nodes != ")"):
                 if (not isinstance(parameter_nodes, list)):
                     parameter_nodes = [parameter_nodes]
@@ -1095,12 +942,22 @@ def generate_ir(generator, node):
                     if (parameter_node != ","):
                         parameters.append(parameter_node)
                         
-            fn.parameters = parameters
-            if (gen_node[2] == "}"):
+            fn = Struct(
+                type = "function", 
+                name=function_name, 
+                value_type=function_type, 
+                parameters=parameters
+            )
+            generator.symbol_table[function_name] = fn
+
+            # Generate the function's body
+            gen_node = generate_ir(generator, node.children[-1])
+
+            if (gen_node == "}"):
                 # Empty function
                 fn.ir = Struct(type="ir", value_type="void", value_reg=None, value=[], externs=set())
             else:
-                fn.ir = gen_node[2]
+                fn.ir = gen_node
 
             # If the return type is different from the block type, convert
             if (fn.value_type != fn.ir.value_type):
@@ -1161,6 +1018,183 @@ def generate_ir(generator, node):
             ]
                 
             gen_node = generator.symbol_table[function_name]
+
+        elif (node.data == "parameter_list"):
+            # parameter_list:  parameter_declaration 
+            #   |  parameter_list "," parameter_declaration
+            # Remove extra nesting so the parameter list location is
+            # deterministic at parameter collection time in the function
+            # wrap-up
+            
+            if (len(node.children) > 1):
+                gen_node = generate_ir(generator, node.children[0])
+                gen_node.append(generate_ir(generator, node.children[2]))
+            else:
+                gen_node = [generate_ir(generator, node.children[0])]
+
+        elif (node.data == "parameter_declaration"):
+            # parameter_declaration:  declaration_specifiers declarator
+            # |  declaration_specifiers abstract_declarator?
+            
+            gen_node = []
+            for child in node.children:
+                gen_node.append(generate_ir(generator, child))
+
+            parameter_type, parameter_name = gen_node
+            parameter = Struct(
+                type="variable", 
+                name=parameter_name.value, 
+                value_type=parameter_type, 
+                # LLVM needs a gap of 1 between parameters and local vars
+                value_reg=generator.current_register - 1
+            )
+            
+            generator.symbol_table.set_overflow_item(parameter_name.value, parameter)
+            generator.current_register += 1
+
+            gen_node = parameter
+                            
+
+        elif (node.data == "init_declarator"):
+            # declarator contains one identifier and one or none initializers
+            # init_declarator:  declarator
+            # |  declarator "=" initializer
+            identifier = get_tree_tokens(node.children[0])[0]
+            initializer = None
+            if (len(node.children) > 1):
+                initializer = generate_ir(generator, node.children[2])
+            gen_node = [identifier, initializer]
+
+        elif (node.data == "declaration"):
+            # declaration contains one type and one or more identifiers and or
+            # initializerss
+            # declaration:  declaration_specifiers init_declarator_list? ";"
+
+            # XXX Right now all variables are allocated on the stack, globals
+            #     not supported
+            assert (len(generator.symbol_table) > 1), "Global variables not supported yet!"
+            
+            # The declarator list may contain initializer so it needs
+            # generating
+            if (len(node.children) > 1):
+                gen_node = generate_ir(generator, node.children[1])
+                
+            # Register the variable and create an IR node to hold the
+            # initializer, if any
+            irs = []
+            externs = set()
+            decl_type = get_tree_tokens(node.children[0])[0]
+            for identifier, initializer in gen_node:
+                variable = Struct(
+                    type="variable", 
+                    name=identifier, 
+                    value_type=decl_type,
+                    # Value_reg and value_ref will be assigned on usage
+                )
+                generator.symbol_table[identifier] = variable
+                if (initializer is not None):
+                    # XXX This should come from gen_node instead of having
+                    #     to recreate it here?
+                    a = Struct(type="identifier", value=identifier)
+                    b = initializer
+
+                    # XXX This is a copy-paste of the operation, refactor
+
+                    a_ref, a_reg, a_type = get_ref_reg_and_type(a, irs, externs)
+                    b_reg, b_type = get_reg_and_type(b, irs, externs)
+
+                    res_type = a_type
+
+                    # Convert the input type to the result type
+                    if (b_type != res_type):
+                        b_reg = generate_call_ir(generator, irs, externs, 
+                            get_fn_name("cnv", res_type, b_type), res_type, [b_type, b_reg])
+
+                    a_llvm_type = get_llvm_type(a_type)
+                    
+                    # Perform the store
+                    # "store i32 %0, i32* %3, align 4"
+                    irs.append("store %s %%%d, %s* %%%d, align 4" % (a_llvm_type, b_reg, a_llvm_type, a_ref))    
+                    
+            gen_node = Struct(type="ir", value_type="void", value_reg=None, value=irs, externs=externs)
+
+        elif (node.data == "block_item_list"):
+            # block_item_list:  block_item
+            # |  block_item_list block_item
+            gen_node = generate_ir(generator, node.children[0])
+            if (len(node.children) > 1):
+                # Merge blocks into a single ir node
+                prev_node = gen_node
+                gen_node = generate_ir(generator, node.children[1])
+                gen_node.value = prev_node.value + gen_node.value
+                gen_node.externs.update(prev_node.externs)
+        
+        elif (node.data == "integer_constant"):
+            # XXX Check non decimal encoding (hex, oct)
+            value = node.children[0]
+            value_type = "int"
+            # Conservative suffix, may be smaller
+            suffix = value[-3:].upper()
+            value_len = len(value)
+            # Check type suffixes
+            if ("LL" in suffix):
+                value_type = "long long"
+                value_len -= 2
+            elif ("L" in suffix):
+                # Note LL was checked before, so checking one L here is safe
+                value_type = "long"
+                value_len -= 1
+            # Check sign suffix
+            if ("U" in suffix):
+                value_type = "unsigned " + value_type
+                value_len -= 1
+            value = int(value[:value_len])
+            
+            gen_node = Struct(type="constant", value_type=value_type, value=value)
+
+        elif (node.data == "floating_constant"):
+            float_type = "double"
+            value = node.children[0].value
+            if (value[-1] in ["f", "F"]):
+                float_type = "float"
+
+            if (value[-1] in ["f", "F", "L", "l"]):
+                value = value[:-1]
+
+            value = float(value)
+
+            gen_node = Struct(type="constant", value_type = float_type, value= value)
+
+        elif (node.data == "identifier"):
+            gen_node = Struct(type="identifier", value=node.children[0].value)
+
+        elif ((node.data == "type_name") or (node.data == "declaration_specifiers")):
+            # type_name:  specifier_qualifier_list abstract_declarator?
+            # declaration_specifiers:  storage_class_specifier declaration_specifiers?
+            #   |  type_specifier declaration_specifiers?
+            #   |  type_qualifier declaration_specifiers?
+            #   |  function_specifier declaration_specifiers?
+
+            # XXX Right now assume there's only one type and it's one of the
+            #     basic types, once complex types are supported, the types will
+            #     have to be put in the symbol table and parsed properly
+            res_type = get_tree_tokens(node)
+            res_type = string.join(res_type, " ")
+            gen_node = res_type
+
+        elif (len(node.children) == 1):
+            # Unify with the n children below?
+            # XXX This catch all should go at some point?
+            # XXX This is cumbersome because sometimes we want to always receive
+            #     a list to unify handling, on the other hand creating a one 
+            #     element list here would do nesting, but it's also convenient
+            # XXX Ideally we should handle all nodes individually without catch-all
+            gen_node = generate_ir(generator, node.children[0])
+            
+        else:
+            gen_node = []
+            for child in node.children:
+                gen_node.append(generate_ir(generator, child))
         
     elif (isinstance(node, lark.Token)):
         gen_node = node.value
@@ -1367,14 +1401,12 @@ def epycc_generate(source, debug = False):
     if (debug):
         print tree.pretty()
 
-    # XXX Do a proper symbol table with multi-level lookup (each level is a different
-    #     scope)
     generator = Struct(symbol_table = SymbolTable(), current_register = 0)
     irs = generate_ir(generator, tree)
 
     epycc_dirpath = os.path.dirname(os.path.abspath(__file__))
     generated_c_filepath = os.path.join(epycc_dirpath, "generated", "irs.c")
-    generated_ir_filepath = os.path.join(epycc_dirpath, "generated", "irs.ir")
+    generated_ir_filepath = os.path.join(epycc_dirpath, "generated", "irs.ll")
 
     # Regenerate if they don't exist or same or older than this python file
     if (not os.path.exists(generated_ir_filepath) or
@@ -1449,7 +1481,6 @@ def epycc_compile(source, debug = False):
 
 if (__name__ == "__main__"):
     source = open("samples/current.c").read()
-
     lib = epycc_compile(source, True)
     print lib.ir
     print lib.ir_optimized
