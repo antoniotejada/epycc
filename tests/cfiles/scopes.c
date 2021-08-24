@@ -17,7 +17,7 @@ int f(int a) {
     return b;
 }
 
-// Test that the empty function is allowed
+// Test that the empty function and returning void is allowed
 void empty() {
 }
 

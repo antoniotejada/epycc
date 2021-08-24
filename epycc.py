@@ -42,6 +42,7 @@ from cstruct import Struct
 
 import lark
 import llvmlite.binding as llvm
+import llvmlite.ir as ir
 
 
 def unpack_op_sign_names(ops):
@@ -198,7 +199,8 @@ def get_llvm_type(t):
     #     store this type in the symbol and have get_llvm_result_type, etc?
     #     Or just keep the llvm type around?
     c_to_llvm_types = {
-        "long double" : "x86_fp80",
+        # XXX On windows "long double" is "double", on linux it's "x86_fp80"
+        "long double" : "double",
         "double" : "double",
         "float" : "float",
         "long long" :"i64",
@@ -226,7 +228,46 @@ def get_llvm_type(t):
     
     return c_to_llvm_types[t]
 
-        
+
+def get_llvmlite_type(t):
+    """
+    Return the llvmlite ir type corresponding to a C type
+    """
+
+    c_to_llvmlite_types  = {
+        # XXX By default this is the same as double on Windows x86 instead of x86_fp80, 
+        #     also llvmlite.ir doesn't support x86_fp80
+        "long double" : ir.DoubleType(),
+        "double" : ir.DoubleType(),
+        "float" : ir.FloatType(),
+        "long long" : ir.IntType(64),
+        "signed long long" : ir.IntType(64),
+        "unsigned long long" : ir.IntType(64), 
+        # XXX This depends on LLP64/etc windows is 32-bit
+        "long": ir.IntType(32),
+        "signed long" : ir.IntType(32),
+        "unsigned long" : ir.IntType(32),
+        "int" : ir.IntType(32),
+        "signed int": ir.IntType(32),
+        "unsigned int" : ir.IntType(32),
+        "short" : ir.IntType(16),
+        "signed short" : ir.IntType(16),
+        "unsigned short" : ir.IntType(16),
+        "char" : ir.IntType(8),
+        "signed char" : ir.IntType(8),
+        "unsigned char" : ir.IntType(8),
+        "_Bool" : ir.IntType(1),
+        "void" : ir.VoidType(),
+    }
+    # Make sure we are covering all types
+    assert all((c_type in all_types) for c_type in c_to_llvmlite_types)
+    assert all((c_type in c_to_llvmlite_types) for c_type in all_types)
+
+    llvmlite_type = c_to_llvmlite_types[t]
+
+    return llvmlite_type
+
+
 def get_ctype(t):
     """
     Return the Python ctype corresponding to a C type
@@ -262,7 +303,7 @@ def get_ctype(t):
 
 
 def invoke_clang(c_filepath, ir_filepath, options=""):
-    # Generate the precompiled IR in irs.ir
+    # Generate the precompiled IR in irs.ll
     # clang_filepath = R"C:\android-ndk-r15c\toolchains\llvm\prebuilt\windows-x86_64\bin\clang.exe"
     clang_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_out", "clang.exe")
     # For privacy reasons and since some ir files are pushed to the repo, don't
@@ -356,7 +397,7 @@ def precompile_c_snippets(generated_c_filepath, generated_ir_filepath):
         f.writelines(l)
 
     invoke_clang(generated_c_filepath, generated_ir_filepath)
-
+    
 
 def generate_ir(generator, node):
     def get_grandson(node, parent_indices):
@@ -553,188 +594,96 @@ def generate_ir(generator, node):
                     res_type = "unsigned " + res_type.replace("signed", "").strip()
                 
         return res_type
-
-
-    def get_ref_reg_and_type(a, irs, externs):
+    
+    def get_ir_ref_reg_and_type(a):
         # XXX This is wrong in the case of lvalues of complex expressions 
         #     (pointers, arrays, structs...)
         
         # Get reg and type to deal with allocations
-        get_reg_and_type(a, irs, externs)
+        get_ir_reg_and_type(a)
 
         a = generator.symbol_table[a.value]
         assert a.type == "variable"
 
-        return a.value_ref, a.value_reg, a.value_type
+        return a.ir_ref, a.ir_reg, a.value_type
 
-
-    def get_reg_and_type(a, irs, externs):
-        """
-        Get reg and type for a given source or destination operand
-
-        Generate the necessary instructions and extern references in case a is
-        not in a register yet (identifier or constants)
-        """
-
+    def get_ir_reg_and_type(a):
         if (a.type == "identifier"):
             a = generator.symbol_table[a.value]
             a_type = a.value_type
-            a_llvm_type = get_llvm_type(a_type)
+            a_ir_type = get_llvmlite_type(a_type)
 
-            # l-values need storage to store the value, allocate it if it doesn't
-            # have one already
-            if (not hasattr(a, "value_ref")):
-                a.value_ref = generator.current_register
-                generator.current_register += 1
-                # "%3 = alloca i32, align 4"
-                irs.append("%%%d = alloca %s, align 4" % (a.value_ref, a_llvm_type))
-
+            if (not hasattr(a, "ir_ref")):
+                a.ir_ref = generator.llvmir.builder.alloca(a_ir_type)
+                
                 # If it has a register it means that it has an initial value, 
                 # copy from the register into the storage
-                if (hasattr(a, "value_reg")):
-                    # "store i32 %0, i32* %3, align 4"
-                    irs.append("store %s %%%d, %s* %%%d, align 4" % (a_llvm_type, a.value_reg, a_llvm_type, a.value_ref))
+                if (hasattr(a, "ir_reg")):
+                    generator.llvmir.builder.store(a.ir_reg, a.ir_ref)
 
             # Load from the storage to a new register to make sure the register
-            # value we use is uptodate
-            # XXX This is probably overkill, we should be able to track when the
-            #     existing register holding the value is uptodate?
-            a.value_reg = generator.current_register
-            generator.current_register += 1
-            # "%5 = load i32, i32* %4, align 4"
-            irs.append("%%%d = load %s, %s* %%%d, align 4" % (a.value_reg, a_llvm_type, a_llvm_type, a.value_ref))
-            
+            # value we use is uptodate            
 
-            a_reg = a.value_reg
+            # XXX Loading the ref into a new reg on every access is probably
+            #     overkill, we should be able to track when the existing
+            #     register holding the value is uptodate? (note it's not high
+            #     priority since the loads are removed anyway by the LLVM
+            #     optimizer)
+            a.ir_reg = generator.llvmir.builder.load(a.ir_ref)
+            a_ir_reg = a.ir_reg
             
-
         elif (a.type == "constant"):
-            # IR can operate on constants directly but allocating a register and
-            # storing the constant unifies the path below
             a_type = a.value_type
-            a_llvm_type = get_llvm_type(a_type)
-
-            a_reg = generator.current_register
-            generator.current_register += 1
-
-            # Allocate a pointer to the data in the stack, store the constant
-            # and load into regular (non pointer) register
-
-            # XXX Missing alignment
-            # %3 = alloca float, align 4
-            irs.append("%%%d = alloca %s, align 4" % (a_reg, a_llvm_type))
-                        
-            if (a_type in ["float", "double"]):
-                # LLVM errors out if the float cannot be converted accurately,
-                # always pre-truncate and pass floats in hex, which LLVM
-                # requires to be provided in 64-bits even if it's going to a
-                # 32-bit float store (but still truncated to a value that will 
-                # fit in 32-bits)
-                a_value = a.value
-                if (a_type == "float"):
-                    # Store 64-bit but truncate to 32-bit first to prevent LLVM
-                    # erroring out with "floating point constant invalid for
-                    # type"
-                    a_value = (ctypes.c_float(a.value)).value
-                # XXX Review the endianness here?
-                a_llvm_value = "0x%016x" % struct.unpack("Q", struct.pack("d", a_value))
-
-            else:
-                a_llvm_value = str(a.value)
-            
-            # store float 2.000000e+00, float* %3, align 4, !dbg !30
-            irs.append("store %s %s, %s* %%%d, align 4" % (a_llvm_type, a_llvm_value, a_llvm_type, a_reg))
-            a_reg = generator.current_register
-            generator.current_register += 1
-            # %2 = load double, double* %1, align 4
-            irs.append("%%%d = load %s, %s* %%%d, align 4" % (a_reg, a_llvm_type, a_llvm_type, a_reg-1))
-
-        elif (a.type == "ir"):
-            a_type = a.value_type
-            a_reg = a.value_reg
-            irs.extend(a.value)
-            externs.update(a.externs)
+            a_ir_type = get_llvmlite_type(a_type)
+            a_ir_reg = a_ir_type(a.value)
 
         else:
+            a_ir_reg = a.ir_reg
             a_type = a.value_type
-            a_reg = a.value_reg
 
-        return a_reg, a_type
+        return a_ir_reg, a_type
 
-    def generate_call_ir(generator, irs, externs, fn_name, res_type, type_reg_list):
-        """
-        Generates IR for the given call and the result type, with arguments type
-        and registers in type_reg_list
+    def generate_extern_call_ir(generator, fn_name, res_type, arg_type_ir_regs):
+            
+        arg_types = arg_type_ir_regs[::2]
+        arg_ir_regs = arg_type_ir_regs[1::2]
+        # ir builder errors out when declaring a function more than once, keep
+        # it around for the next time
+        fn_ir = generator.llvmir.externs.get(fn_name, None)
+        if (fn_ir is None):
+            fn_llvmlite_type = ir.FunctionType(
+                get_llvmlite_type(res_type), 
+                [get_llvmlite_type(arg_type) for arg_type in arg_types]
+            )
 
-        Returns the result register
-        """
-        res_reg = generator.current_register
-        generator.current_register += 1
+            fn_ir = ir.Function(generator.llvmir.module, fn_llvmlite_type, fn_name)
+            generator.llvmir.externs[fn_name] = fn_ir
 
-        # %5 = call float @mul__float__float__unsigned_int(float %1, unsigned int %4)
-        args = [
-            ("%s %%%d" % (get_llvm_type(type_reg_list[i*2]), type_reg_list[i*2+1])) 
-                for i in xrange(len(type_reg_list) / 2) 
-        ]
-        ir = "%%%d = call %s @%s(%s)" % (res_reg, get_llvm_type(res_type), fn_name, string.join(args, ","))
-        irs.append(ir)
-        externs.add(fn_name)
+        res_ir_reg = generator.llvmir.builder.call(fn_ir, arg_ir_regs)
 
-        return res_reg
-
-    def detach_ir(a, irs, externs):
-        if (a.type == "ir"):
-            irs.extend(a.value)
-            externs.update(a.externs)
-
-            a.value = []
-            a.externs = set()
+        return res_ir_reg
 
     def generate_assign_ir(generator, a, b):
-        irs = []
-        externs = set()
-
-        # We need to make sure the IRs for a and b are always generated before
-        # the assign or the type conversion, since they could contain stores,
-        # etc needed for the conversions
-        # XXX This should go away once IR is stored in a global place with a builder
-        detach_ir(a, irs, externs)
-        detach_ir(b, irs, externs)
-
-        a_ref, a_reg, a_type = get_ref_reg_and_type(a, irs, externs)
-        b_reg, b_type = get_reg_and_type(b, irs, externs)
+        a_ir_ref, a_ir_reg, a_type = get_ir_ref_reg_and_type(a)
+        b_ir_reg, b_type = get_ir_reg_and_type(b)
 
         # Return the value in case it's used as part of an expression
         res_type = a_type
-        res_reg = b_reg
-        
+        res_ir_reg = b_ir_reg
+
         # Convert the input type to the result type
         if (b_type != res_type):
-            b_reg = generate_call_ir(generator, irs, externs, 
-                get_fn_name("cnv", res_type, b_type), res_type, [b_type, b_reg])
+            b_ir_reg = generate_extern_call_ir(generator, 
+                get_fn_name("cnv", res_type, b_type), res_type, [b_type, b_ir_reg])
 
-        a_llvm_type = get_llvm_type(a_type)
-        
-        # Perform the store
-        # "store i32 %0, i32* %3, align 4"
-        irs.append("store %s %%%d, %s* %%%d, align 4" % (a_llvm_type, b_reg, a_llvm_type, a_ref))
+        generator.llvmir.builder.store(b_ir_reg, a_ir_ref)
 
-        gen_node = Struct(type="ir", value_type=res_type, value_reg = res_reg, value=irs, externs=externs)
+        gen_node = Struct(type="ir", value_type=res_type, ir_reg=res_ir_reg)
 
         return gen_node
 
 
     def generate_binop_ir(generator, a, b, op_sign):
-        irs = []
-        externs = set()
-
-        # We need to make sure the IRs for a and b are always generated before
-        # the assign or the type conversion, since they could contain stores,
-        # etc needed for the conversions
-        # XXX This should go away once IR is stored in a global place with a builder
-        detach_ir(a, irs, externs)
-        detach_ir(b, irs, externs)
-
         # Call the precompiled C function for this expression (these calls
         # are not a performance issue, since they were verified be inlined
         # and optimized in LLVM optimize mode).
@@ -743,33 +692,30 @@ def generate_ir(generator, node):
         # the precompiled function takes care of C-compliant sign
         # extension/truncation of operands and result
 
-        # XXX Investigate using the builder in two steps, first converting
-        #     the types, then performing the operation, is very error prone
-        #     wrt C compliance
-        # XXX Another option is to use the builder and then precompile only
-        #     data conversion functions.
-        # XXX Yet another option which reduces the number of precompiled
-        #     functions is to precompile same-argument operation functions
-        #     and then data conversion functions.
-        a_reg, a_type = get_reg_and_type(a, irs, externs)
-        b_reg, b_type = get_reg_and_type(b, irs, externs)
+        # XXX Investigate how error prone regarding C compliance would be using
+        #     the builder without pregenerated snippets, ie doing conversion and
+        #     operations through the builder and maybe pregenerating builder
+        #     instructions instead of llvm.
+        a_ir_reg, a_type = get_ir_reg_and_type(a)
+        b_ir_reg, b_type = get_ir_reg_and_type(b)
+
         res_type = get_result_type(op_sign, a_type, b_type)
 
         # Convert the input types to the result type
         if (a_type != res_type):
-            a_reg = generate_call_ir(generator, irs, externs,
-                get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_reg])
+            a_ir_reg = generate_extern_call_ir(generator, 
+                get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_ir_reg])
             
         if (b_type != res_type):
-            b_reg = generate_call_ir(generator, irs, externs, 
-                get_fn_name("cnv", res_type, b_type), res_type, [b_type, b_reg])
+            b_ir_reg = generate_extern_call_ir(generator, 
+                get_fn_name("cnv", res_type, b_type), res_type, [b_type, b_ir_reg])
 
         # Perform the operation in res_type
         fn_name = get_fn_name(binop_sign_to_name[op_sign], res_type, res_type, res_type)
-        res_reg = generate_call_ir(generator, irs, externs, fn_name, 
-            res_type, [res_type, a_reg, res_type, b_reg])
+        res_ir_reg = generate_extern_call_ir(generator, fn_name, res_type, 
+            [res_type, a_ir_reg, res_type, b_ir_reg])
 
-        gen_node = Struct(type="ir", value_type=res_type, value_reg = res_reg, value=irs, externs=externs)
+        gen_node = Struct(type="ir", value_type=res_type, ir_reg=res_ir_reg)
 
         return gen_node
 
@@ -777,11 +723,6 @@ def generate_ir(generator, node):
     gen_node = None
     # Node can be Token or Tree
     if (type(node) is lark.Tree):
-
-        #
-        # in order visit
-        #
-
         # XXX When there's more than one child we need to special case some
         #     of the rules so we avoid returning too much nesting or long
         #     lists that make things down the line  harder or
@@ -817,18 +758,16 @@ def generate_ir(generator, node):
                 gen_node = generate_ir(generator, node.children[0])
                 res_type = None
 
-            irs = []
-            externs = set()
-            a_reg, a_type = get_reg_and_type(gen_node, irs, externs)
+            a_ir_reg, a_type = get_ir_reg_and_type(gen_node)
             
             if ((res_type is not None) and (res_type != a_type)):
-                res_reg = generate_call_ir(generator, irs, externs,
-                    get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_reg])
+                res_ir_reg = generate_extern_call_ir(generator, 
+                    get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_ir_reg])
             else:
-                res_reg = a_reg
+                res_ir_reg = a_ir_reg
                 res_type = a_type
 
-            gen_node = Struct(type="ir", value_type=res_type, value_reg=res_reg, value=irs, externs=externs)
+            gen_node = Struct(type="ir", value_type=res_type, ir_reg=res_ir_reg)
 
         elif (node.data == "primary_expression"):
             # primary_expression:  identifier
@@ -911,21 +850,8 @@ def generate_ir(generator, node):
             # type information before body is generated, in case function's
             # body needs it eg because calls it recursively
             
-            
             # Read return type
             function_type = generate_ir(generator, node.children[0])
-            
-            # Reset the register allocator index on every new function Looks
-            # like LLVM IR requires the n function parameters take the first n
-            # indices, then there's an empty index, and then the indices for the
-            # local variables (index 0 will be unused on functions with no
-            # parameters). To simplify that handling without having to pass the
-            # number of parameters from the function definition to the function
-            # block, which is cumbersome:
-            # - start the generator index at 1
-            # - have the parameters use index-1
-            # - have the local variables use index
-            generator.current_register = 1
             
             # Read name and parameters
             gen_node = generate_ir(generator, node.children[1])
@@ -950,74 +876,129 @@ def generate_ir(generator, node):
             )
             generator.symbol_table[function_name] = fn
 
+            # Create the function in the IR builder
+            fn_llvmlite_type = ir.FunctionType(
+                get_llvmlite_type(function_type), 
+                [get_llvmlite_type(parameter.value_type) for parameter in parameters]
+            )
+            
+            generator.llvmir.function = ir.Function(generator.llvmir.module, fn_llvmlite_type, name=function_name)
+
+            # Link the parameters to the ir builder function arguments
+            for parameter, arg in zip(parameters, generator.llvmir.function.args):
+                parameter.ir_reg = arg
+
+            # Give a hard-coded name that gets removed below since clang-generated
+            # tests don't contain a basic block entry label
+            block = generator.llvmir.function.append_basic_block("entry")
+            generator.llvmir.builder = ir.IRBuilder(block)
+            
             # Generate the function's body
             gen_node = generate_ir(generator, node.children[-1])
 
             if (gen_node == "}"):
                 # Empty function
-                fn.ir = Struct(type="ir", value_type="void", value_reg=None, value=[], externs=set())
+                fn.ir = Struct(type="ir", value_type="void", ir_reg=None)
             else:
                 fn.ir = gen_node
 
             # If the return type is different from the block type, convert
             if (fn.value_type != fn.ir.value_type):
                 a_type = fn.ir.value_type
-                a_reg = fn.ir.value_reg
+                a_ir_reg = fn.ir.ir_reg
                 res_type = fn.value_type
-                irs = fn.ir.value
-                externs = fn.ir.externs
-                res_reg = generate_call_ir(generator, irs, externs,
-                    get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_reg])
-        
-                fn.ir = Struct(type="ir", value_type=res_type, value_reg=res_reg, value=irs, externs=externs)
+                res_ir_reg = generate_extern_call_ir(generator, get_fn_name("cnv", res_type, a_type),
+                    res_type, [a_type, a_ir_reg])
+                
+                fn.ir = Struct(type="ir", value_type=res_type, ir_reg=res_ir_reg)
                 
             # Now really return the value
-            # ret float %11, !dbg !29
-            # ret void, !dbg !33
-            irs = fn.ir.value
-            externs = fn.ir.externs
-            res_reg = fn.ir.value_reg
+            res_ir_reg = fn.ir.ir_reg
             res_type = fn.ir.value_type
             if (fn.value_type == "void"):
-                irs.append("ret void")
+                generator.llvmir.builder.ret_void()
 
             else:
-                # Note this can be a straight constant, so always create a new
-                # ir node and get the reg and type
-                irs = []
-                externs = set()
-                res_reg, res_type = get_reg_and_type(fn.ir, irs, externs)
-                irs.append("ret %s %%%d" % (get_llvm_type(res_type), res_reg))
-                
-            fn.ir = Struct(type="ir", value_type=res_type, value_reg=res_reg, value=irs, externs=externs)
+                generator.llvmir.builder.ret(res_ir_reg)
 
-            # Right now we generate IR with unique register indices but not
-            # guaranteed to be monotonically increasing wrt where they appear in
-            # the sequence of instructions. The indices are allocated at
-            # expression parsing time, which is not the same as instruction
-            # execution order (eg in the presence of parenthesis,etc). LLVM will
-            # error out if it finds non-monotonically increasing register
-            # indices. Reindex the registers so they are monotonically
-            # increasing wrt instruction execution order
 
-            # XXX This should be fixed by using llvmlite's IrBuilder instead 
-            #     of strings?
+            # Using llvmir, the llvm code can be obtained by just str(module)
+            # but that generates code that makes it hard to compare against
+            # clang:
+            # - llvmir uses a deduplication naming convention for registers,
+            #   this is not an issue for registers used in code that will be
+            #   optimized, since optimizing the code will reindex them to match
+            #   clang, but function parameters are never reindexed, even in
+            #   optimized code
+            # - llvmir declares the snippet functions with "declare", which
+            #   prevents from including the functions in the same module since
+            #   llvm will error out if declared functions are present in the
+            #   module where they are declared (snippets could be included in a
+            #   different module, though, but it's not as convenient as having
+            #   everything in the same listing). 
+
+            # Given the above, 
+            # - generate code that doesn't have declares by doing str(function)
+            #   on each function.
+            # - reindex the llvmir register names to match clang
             
-            # Build the reindexing table, initialize with the parameters and the
-            # empty gap
-            index_to_index = { i : i for i in xrange(len(fn.parameters)+1) }
-            for m in re.finditer(r"%(\d+)", string.join(fn.ir.value, "")):
-                reg_index = int(m.group(1))
-                if (reg_index not in index_to_index):
-                    index_to_index[reg_index] = len(index_to_index)
+            llvm_ir = str(generator.llvmir.function).splitlines()
 
-            # Perform the replacement
-            fn.ir.value = [
-                re.sub("%(\d+)", lambda m: "%%%d" % index_to_index[int(m.group(1))], value)
-                for value in fn.ir.value
-            ]
+            # Regarding the reindexing, clang's convention is:
+            # - registers 0 to N - 1 are taken by the N function parameters
+            # - register N is empty (maybe used for the basic block or the
+            #   return value?)
+            # - registers N + 1 and beyond are used by temporaries.
+            # - register names are allocated strictly monotonically and as they
+            #   first appear in the instruction stream (otherwise llvm will
+            #   error out)
+
+            # Initialize the reindexing table with the parameters and the empty
+            # gap
+            # define i32 @"f"(i32 %".1", i32 %".2")
+            index_to_index = { "%%\".%d\"" % (i+1) : "%%%d" % i for i in xrange(len(fn.parameters)+1) }
+            re_reg = re.compile(r"(%\"\.\d+\")")
+
+            # Perform the replacement and filter out the define, braces and
+            # entry basic block label coming from llvmir since they mismatch
+            # what clang produces
+            fn.llvm_ir = []
+            for l in llvm_ir:
+                if (l.startswith("define")):
+                    # Use a define line that matches clang, eg
+                    #   define dso_local zeroext i16  @add__int__int__short(i32, i16 zeroext) {
+                    # LLVM type extension goes first in function return value, last on function parameters
+                    l = "define dso_local %s %s @%s(%s) {" % (
+                        get_llvm_type_ext(fn.value_type),
+                        get_llvm_type(fn.value_type),
+                        fn.name,
+                        string.join([
+                            ("%s %s" % (get_llvm_type(parameter.value_type), get_llvm_type_ext(parameter.value_type)))
+                            for parameter in fn.parameters], ",")
+                    )
+                
+                elif (l.startswith("{") or l.startswith("entry:")):
+                    # Skip the entry basic block label, and the brace that was
+                    # already set in the defifne line
+                    continue
+
+                else:
+                    # Update the reindexing table and replace with the new index
+                    s = 0
+                    new_l = ""
+                    for m in re_reg.finditer(l):
+                        reg_index = m.group(1)
+                        if (reg_index not in index_to_index):
+                            index_to_index[reg_index] = "%%%d" % len(index_to_index)
+                        new_l += l[s:m.start(1)] + index_to_index[reg_index]
+                        s = m.end(1)
+                    l = new_l + l[s:]
+
+                fn.llvm_ir.append(l)
                 
             gen_node = generator.symbol_table[function_name]
+
+            generator.function = None
 
         elif (node.data == "parameter_list"):
             # parameter_list:  parameter_declaration 
@@ -1045,13 +1026,10 @@ def generate_ir(generator, node):
                 type="variable", 
                 name=parameter_name.value, 
                 value_type=parameter_type, 
-                # LLVM needs a gap of 1 between parameters and local vars
-                value_reg=generator.current_register - 1
             )
             
             generator.symbol_table.set_overflow_item(parameter_name.value, parameter)
-            generator.current_register += 1
-
+            
             gen_node = parameter
                             
 
@@ -1081,8 +1059,6 @@ def generate_ir(generator, node):
                 
             # Register the variable and create an IR node to hold the
             # initializer, if any
-            irs = []
-            externs = set()
             decl_type = get_tree_tokens(node.children[0])[0]
             for identifier, initializer in gen_node:
                 variable = Struct(
@@ -1098,37 +1074,22 @@ def generate_ir(generator, node):
                     a = Struct(type="identifier", value=identifier)
                     b = initializer
 
-                    # XXX This is a copy-paste of the operation, refactor
-
-                    a_ref, a_reg, a_type = get_ref_reg_and_type(a, irs, externs)
-                    b_reg, b_type = get_reg_and_type(b, irs, externs)
-
-                    res_type = a_type
-
-                    # Convert the input type to the result type
-                    if (b_type != res_type):
-                        b_reg = generate_call_ir(generator, irs, externs, 
-                            get_fn_name("cnv", res_type, b_type), res_type, [b_type, b_reg])
-
-                    a_llvm_type = get_llvm_type(a_type)
+                    generate_assign_ir(generator, a, b)
                     
-                    # Perform the store
-                    # "store i32 %0, i32* %3, align 4"
-                    irs.append("store %s %%%d, %s* %%%d, align 4" % (a_llvm_type, b_reg, a_llvm_type, a_ref))    
-                    
-            gen_node = Struct(type="ir", value_type="void", value_reg=None, value=irs, externs=externs)
+            gen_node = Struct(type="ir", value_type="void", ir_reg=None)
+            
 
         elif (node.data == "block_item_list"):
             # block_item_list:  block_item
             # |  block_item_list block_item
+
+            # The code is accumulated in the builder, just return the last block
+            # in the list
             gen_node = generate_ir(generator, node.children[0])
             if (len(node.children) > 1):
-                # Merge blocks into a single ir node
-                prev_node = gen_node
                 gen_node = generate_ir(generator, node.children[1])
-                gen_node.value = prev_node.value + gen_node.value
-                gen_node.externs.update(prev_node.externs)
-        
+                
+            
         elif (node.data == "integer_constant"):
             # XXX Check non decimal encoding (hex, oct)
             value = node.children[0]
@@ -1389,7 +1350,7 @@ def epycc_generate(source, debug = False):
 
     # XXX Earley is really slow (~13 lines per second) and causes stack overflow
     #     with long C files (thousands of lines). Massage the grammar to be
-    #     LALR(1) and switch to LALR parser. Optionallly once epycc can
+    #     LALR(1) and switch to LALR parser. Optionally once epycc can
     #     bootstrap itself and write the parser code code in C (the AST
     #     traversal can remain in Python).
     grammar_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
@@ -1401,8 +1362,12 @@ def epycc_generate(source, debug = False):
     if (debug):
         print tree.pretty()
 
-    generator = Struct(symbol_table = SymbolTable(), current_register = 0)
-    irs = generate_ir(generator, tree)
+    generator = Struct(
+        symbol_table = SymbolTable(), 
+        llvmir = Struct(module=ir.Module(), function=None, externs=dict())
+    )
+    
+    generate_ir(generator, tree)
 
     epycc_dirpath = os.path.dirname(os.path.abspath(__file__))
     generated_c_filepath = os.path.join(epycc_dirpath, "generated", "irs.c")
@@ -1417,33 +1382,16 @@ def epycc_generate(source, debug = False):
     
     llvm_ir = []
     function_signatures = []
-    function_externs = set()
+    function_externs = generator.llvmir.externs.keys()
     assert len(generator.symbol_table) == 1, "Symbol table is not at global scope!!!"
+    # Collect function signatures in ctypes format
     for sym in generator.symbol_table.values():
         if (sym.type == "function"):
-            
-            # Collect externs
-            function_externs.update(sym.ir.externs)
 
-            # Dump this function's IR
-            #   define dso_local zeroext i16  @add__int__int__short(i32, i16 zeroext) {
-            # LLVM type extension goes first in function return value, last on function parameters
-            llvm_ir.append("define dso_local %s %s @%s(%s) {" % (
-                get_llvm_type_ext(sym.value_type),
-                get_llvm_type(sym.value_type),
-                sym.name,
-                string.join([
-                    
-                    ("%s %s" % (get_llvm_type(parameter.value_type), get_llvm_type_ext(parameter.value_type)))
-                    for parameter in sym.parameters], ",")
-            ))
-
-            for l in sym.ir.value:
-                llvm_ir.append("  " + l)
-            llvm_ir.append("}")
+            llvm_ir.extend(sym.llvm_ir)
             llvm_ir.append("")
             llvm_ir.append("")
-            
+
             function_signature = Struct(
                 name=sym.name, 
                 ctypes = [get_ctype(sym.value_type)] + 
@@ -1452,8 +1400,9 @@ def epycc_generate(source, debug = False):
 
             function_signatures.append(function_signature)
 
+    
     for function_extern in function_externs:
-        # Dump the extern functions needed by this function
+        # Dump the extern functions needed by this module
         extern = all_externs[function_extern]
         llvm_ir.append(extern[0])
         for l in extern[1:-1]:
