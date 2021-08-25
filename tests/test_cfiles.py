@@ -290,19 +290,21 @@ def test_single_cfile(test_filepath, ignore_existing_files=False):
     # not contain all the helper functions the test IR does contain (and which don't
     # need testing)
     for fn_name in gold_ir:
-        # XXX Ignore the first line for now because clang contains "#0" but llvmlite
-        #     doesn't
+        # XXX Ignore the first line for now because clang contains "#0" but
+        #     llvmlite doesn't
         ## print "Checking", fn_name
         test_count += 1
         function_mismatch_count = 0
         mismatches = []
+        # Make the IR as clang-like as possible before comparing 
+        epycc_ir[fn_name] = epycc.convert_to_clang_irs(epycc_ir[fn_name])
         for l_epycc, l_gold in zip(epycc_ir[fn_name][1:], gold_ir[fn_name][1:]):
             if (l_gold != l_epycc):
                 function_mismatch_count += 1
                 mismatches.append([l_gold, l_epycc])
         
         # Get expected mismatch count from function name
-        # XXX Use epycc parsing and get this from pragmas or such?
+        # XXX Use epycc parsing and get this from pragmas __attribute__ or such?
         m = re.match(r".*__mm(\d+)", fn_name)
         expected_function_mismatch_count = 0
         if (m is not None):

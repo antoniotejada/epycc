@@ -14,9 +14,9 @@ float fmul(float a, float b) {
     return a * b;
 }
 
-// Three mismatches expected, epycc generates a phi select node, clang generates
-// or and one instruction more
-float flor__mm3(float a, float b) {
+// Two mismatches expected, epycc generates a phi select node, clang generates
+// or and epycc a select instruction
+float flor__mm2(float a, float b) {
     return a || b;
 }
 
