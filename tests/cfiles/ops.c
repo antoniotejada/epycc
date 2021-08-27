@@ -36,3 +36,10 @@ signed char fcast(int a) {
     return (unsigned int) a;
 }
 
+float fpp(float a) {
+    return a++;
+}
+
+float fmm(float a) {
+    return a--;
+}

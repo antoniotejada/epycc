@@ -71,3 +71,13 @@ int fif_local(int a) {
     }
     return b;
 }
+
+int fif_return(int a) {
+    int b;
+    if (a == 1) {
+        return 1;
+    } else {
+        return 2;
+    }
+    return b;
+}

@@ -222,6 +222,8 @@ import re
 import string
 import sys
 import time
+import traceback
+
 
 # Add the parent dir to syspath to be able to import epycc
 epycc_dirpath = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -230,6 +232,8 @@ import epycc
 
 def test_single_cfile(test_filepath, ignore_existing_files=False):
     print "testing", os.path.split(test_filepath)[1]
+
+    sys.stdout.flush()
 
     out_dir = os.path.join(epycc_dirpath, "_out")
     gold_dir = os.path.join(epycc_dirpath, "_out")
@@ -251,7 +255,7 @@ def test_single_cfile(test_filepath, ignore_existing_files=False):
         #   a fresh repo passes the tests)
         epycc.invoke_clang(test_filepath, gold_ir_filepath)
         epycc.invoke_clang(test_filepath, gold_optimized_ir_filepath, "-O2")
-        
+    
 
     # Compile with epycc
 
@@ -279,7 +283,7 @@ def test_single_cfile(test_filepath, ignore_existing_files=False):
                 s = ""
             s += l
             i += 1
-            
+
     epycc_ir = epycc.load_functions_ir(test_optimized_ir_filepath)
     gold_ir = epycc.load_functions_ir(gold_optimized_ir_filepath)
 
@@ -289,38 +293,41 @@ def test_single_cfile(test_filepath, ignore_existing_files=False):
     # Start with the gold IR since if the gold IR was generated with clang, it will
     # not contain all the helper functions the test IR does contain (and which don't
     # need testing)
-    for fn_name in gold_ir:
-        # XXX Ignore the first line for now because clang contains "#0" but
-        #     llvmlite doesn't
-        ## print "Checking", fn_name
-        test_count += 1
-        function_mismatch_count = 0
-        mismatches = []
-        # Make the IR as clang-like as possible before comparing 
-        epycc_ir[fn_name] = epycc.convert_to_clang_irs(epycc_ir[fn_name])
-        for l_epycc, l_gold in zip(epycc_ir[fn_name][1:], gold_ir[fn_name][1:]):
-            if (l_gold != l_epycc):
-                function_mismatch_count += 1
-                mismatches.append([l_gold, l_epycc])
+
+    functions_mismatches = epycc.llvm_ir_diff(gold_optimized_ir_filepath, test_optimized_ir_filepath)
         
-        # Get expected mismatch count from function name
-        # XXX Use epycc parsing and get this from pragmas __attribute__ or such?
-        m = re.match(r".*__mm(\d+)", fn_name)
-        expected_function_mismatch_count = 0
-        if (m is not None):
-            expected_function_mismatch_count = int(m.group(1))
+    for fn_name in gold_ir:
+        
+        try:
+            test_count += 1
+            mismatches = functions_mismatches[fn_name]
+            function_mismatch_count = len(mismatches)
+            
+            # Get expected mismatch count from function name
+            # XXX Use epycc parsing and get this from pragmas __attribute__ or such?
+            m = re.match(r".*__mm(\d+)", fn_name)
+            expected_function_mismatch_count = 0
+            if (m is not None):
+                expected_function_mismatch_count = int(m.group(1))
 
-        if (expected_function_mismatch_count != function_mismatch_count):
-            print "Expected",expected_function_mismatch_count, "mismatches but found", function_mismatch_count, "in", fn_name,":"
-            for mismatch in mismatches:
-                l_gold, l_epycc = mismatch
-                print repr(l_gold), "vs",  repr(l_epycc)
-            print "gold"
-            print string.join(gold_ir[fn_name], "\n")
-            print "epycc"
-            print string.join(epycc_ir[fn_name], "\n")
+            if (expected_function_mismatch_count != function_mismatch_count):
+                print "Expected",expected_function_mismatch_count, "mismatches but found", function_mismatch_count, "in", fn_name,":"
+                for mismatch in mismatches:
+                    l_gold, l_epycc = mismatch
+                    print repr(l_gold), "vs",  repr(l_epycc)
+                print "gold"
+                print string.join(gold_ir[fn_name], "\n")
+                print "epycc"
+                print string.join(epycc_ir[fn_name], "\n")
+                
+            unexpected_mismatch_count += (function_mismatch_count - expected_function_mismatch_count)
 
-        unexpected_mismatch_count += (function_mismatch_count - expected_function_mismatch_count)
+            sys.stdout.flush()
+            
+        except Exception as e:
+            print "Exception in function", fn_name
+            raise
+
 
     print "Ran", test_count, "tests, found", unexpected_mismatch_count, "unexpected mismatches"
 
@@ -333,8 +340,12 @@ if (__name__ == "__main__"):
     cfiles_dirpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cfiles")
     for (dirpath, dirnames, filenames) in os.walk(cfiles_dirpath):
         for test_filename in filenames:
-            if (test_filename.endswith(".c")):
-                test_filepath = os.path.join(dirpath, test_filename)
+            try:
+                if (test_filename.endswith(".c")):
+                    test_filepath = os.path.join(dirpath, test_filename)
 
-                unexpected_mismatch_count = test_single_cfile(test_filepath, ignore_existing_files)
-                assert(unexpected_mismatch_count == 0)
+                    unexpected_mismatch_count = test_single_cfile(test_filepath, ignore_existing_files)
+                    assert(unexpected_mismatch_count == 0)
+            except Exception as e:
+                traceback.print_exc()
+

@@ -316,6 +316,15 @@ def invoke_clang(c_filepath, ir_filepath, options=""):
     )
     os.system(cmd)
 
+def invoke_dot(filepath):
+    dot_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_out", "dot.exe")
+    cmd = R"%s -Tpng -o %s.png %s" %(
+        dot_filepath,
+        os.path.relpath(filepath),
+        os.path.relpath(filepath)
+    )
+    os.system(cmd)
+
 
 def precompile_c_snippets(generated_c_filepath, generated_ir_filepath):
     """
@@ -486,7 +495,7 @@ def convert_to_clang_irs(llvm_irs):
 
         else:
             # Use the incoming names, don't use default parameter names since
-            # they may be used in the code
+            # they may be used in the code for regular registers
             parameter_name = parameter_type_name[1]
                 
         parameter_type = parameter_type_name[0]
@@ -509,12 +518,24 @@ def convert_to_clang_irs(llvm_irs):
     # %spec.select = select i1 %2, i32 0, i32 %0
     # but skip label usage:
     # br i1 %".8", label %"entry.if", label %"entry.endif"
-    # re_reg_label_decl = re.compile(r'(%[".0-9]+)[, \n]|(^[^:\n]+):', re.MULTILINE)
-    re_reg_label_decl = re.compile(r'(%("[.0-9]+"|[.0-9a-z]+))[, \n]|(^[^:\n]+):', re.MULTILINE)
+    # comments
+    # forbody.preheader:                                ; preds = %entry
+    # Phi node
+    #  %.3.0.lcssa = phi float [ 0.000000e+00, %entry ], [ %phitmp, %forbody.preheader ]
+    # XXX Register assign is what increments the register count and has to be
+    #     at the beginning of the line, which simplifies things
+    re_reg_label_decl = re.compile(r'(^%"?[.0-9a-z_]+"?)[, \n]|(^[^:\n]+):', re.MULTILINE)
     re_reg_label_decl_usage = re.compile(r'(%[^ ,)]+)|(^[^:]+:)')
-    
+
+    # Find all the labels
+    llvm_ir = string.join(llvm_irs[1:], "\n")
+    labels = re.findall(r"^([^:\n]+):", llvm_ir, re.MULTILINE)
+    labels = set(["%%%s" % label for label in labels])
+
+    name_to_index["%entry"] = "%%%d" % len(fn.parameters)
+
     # Ignore the first line with the define
-    for m in re_reg_label_decl.finditer(string.join(llvm_irs[1:], "\n")):
+    for m in re_reg_label_decl.finditer(llvm_ir):
         match_index = m.lastindex
         reg_label_name = m.group(match_index)
         if (reg_label_name not in name_to_index):
@@ -522,18 +543,22 @@ def convert_to_clang_irs(llvm_irs):
             # declaration 
             
             if (match_index == 1):
-                # register usage found, fill in substitution
-                # %".3" to %N
-                name_to_index[reg_label_name] = "%%%d" % index_count
-                index_count += 1
+                # Ignore label usages, only care about register usages and label
+                # delcarations
+                if (reg_label_name not in labels):    
+                    # register usage found, fill in substitution
+                    # %".3" to %N
+                    name_to_index[reg_label_name] = "%%%d" % index_count
+                    index_count += 1
                 
             elif (reg_label_name != "entry"):
                 # label declaration found, fill in substitutions for
                 # label usage and label declaration
 
                 # Usage:
-                # %"entry.endif" to %n
+                # %"entry.endif" and %entry.endif to %n
                 name_to_index['%%"%s"' % reg_label_name] = "%%%d" % index_count
+                name_to_index['%%%s' % reg_label_name] = "%%%d" % index_count
 
                 # Declaration
                 # entry.endif: to "; <label>:5:"
@@ -797,7 +822,11 @@ def generate_ir(generator, node):
             a_ir_type = get_llvmlite_type(a_type)
 
             if (not hasattr(a, "ir_ref")):
-                a.ir_ref = generator.llvmir.builder.alloca(a_ir_type)
+                # Always create allocas in entry block so they are available
+                # everywhere even across disjoint basic blocks and don't get
+                # reallocated inside loops, etc
+                with generator.llvmir.builder.goto_entry_block():
+                    a.ir_ref = generator.llvmir.builder.alloca(a_ir_type)
                 
                 # If it has a register it means that it has an initial value, 
                 # copy from the register into the storage
@@ -907,6 +936,22 @@ def generate_ir(generator, node):
         return gen_node
 
 
+    def generate_incr_ir(generator, a, op_sign, post = True):
+        # Note this generates a reg with the previous value that can be 
+        # returned in case of post increment/decrement
+        a_ir_reg, a_type = get_ir_reg_and_type(a)
+
+        b = Struct(type="constant", value_type=a_type, value=1)
+
+        b = generate_binop_ir(generator, a, b, op_sign)
+        gen_node = generate_assign_ir(generator, a, b)
+
+        if (post):
+            gen_node = Struct(type="ir", value_type=a_type, ir_reg=a_ir_reg)
+
+        return gen_node
+
+
     gen_node = None
     # Node can be Token or Tree
     if (type(node) is lark.Tree):
@@ -924,9 +969,55 @@ def generate_ir(generator, node):
             gen_node = generate_ir(generator, node.children[1])
             generator.symbol_table.pop_scope()
 
+        elif (node.data == "postfix_expression"):
+            # postfix_expression:  primary_expression
+            # |  postfix_expression "[" expression "]"
+            # |  postfix_expression "(" argument_expression_list? ")"
+            # |  postfix_expression "." identifier
+            # |  postfix_expression "->" identifier
+            # |  postfix_expression "++"
+            # |  postfix_expression "--"
+            # |  "(" type_name ")" "{" initializer_list "}"
+            # |  "(" type_name ")" "{" initializer_list "," "}"
+
+            if (node.children[0].data == "primary_expression"):
+                gen_node = generate_ir(generator, node.children[0])
+
+            elif (node.children[1] in ["++", "--"]):
+                # Perform new_a = old_a +- 1, return old_a
+                gen_node = generate_ir(generator, node.children[0])
+                
+                op_sign = node.children[1][0]
+                gen_node = generate_incr_ir(generator, gen_node, op_sign, True)
+
+            else:
+                # XXX Support the rest of postfix_expression
+                assert False, "Unhandled postfix_expression %s" % node
+
+        elif (node.data == "unary_expression"):
+            # unary_expression:  postfix_expression
+            # |  "++" unary_expression
+            # |  "--" unary_expression
+            # |  unary_operator cast_expression
+            # |  "sizeof" unary_expression
+            # |  "sizeof" "(" type_name ")"
+            if (len(node.children) == 1):
+                gen_node = generate_ir(generator, node.children[0])
+
+            elif (node.children[0] in ["++", "--"]):
+                # perform new_a = old_a +- 1, return new_a
+                gen_node = generate_ir(generator, node.children[1])
+
+                op_sign = node.children[0][1]
+                gen_node = generate_incr_ir(generator, gen_node, op_sign, False)
+                
+            else:
+                assert False, "Unsupported unary_expression %s" % repr(node)
+            
         elif (node.data == "cast_expression"):
             # cast_expression:  unary_expression
             #  |  "(" type_name ")" cast_expression
+            
 
             # Always make sure expressions leave as IR nodes. 
             # This takes care of not pushing constants and identifiers up
@@ -1002,11 +1093,49 @@ def generate_ir(generator, node):
             if (len(node.children) > 1):
                 gen_node = generate_ir(generator, node.children[0])
 
-        elif ((node.data == "jump_statement") and (node.children[0].value == "return")):
-            # jump_statement: ... | "return" expression? ";" | ...
-            if (len(node.children) > 2):
-                gen_node = generate_ir(generator, node.children[1])
-            
+        elif (node.data == "jump_statement"):
+            # jump_statement:  "goto" identifier ";"
+            #     |  "continue" ";"
+            #     |  "break" ";"
+            #     |  "return" expression? ";"
+            if (node.children[0].value == "return"):
+                function_name = generator.llvmir.function.name
+                fn = generator.symbol_table[function_name]
+                    
+                if (fn.value_type == "void"):
+                    assert (len(node.children) == 2)
+                    generator.llvmir.builder.ret_void()
+
+                else:
+                    gen_node = generate_ir(generator, node.children[1])
+                    res_ir_reg = gen_node.ir_reg
+                    res_type = gen_node.value_type
+
+                    # If the return type is different from the expression,
+                    # convert
+                    if (fn.value_type != res_type):
+                        assert (len(node.children) == 3)
+                        
+                        a_type = res_type
+                        a_ir_reg = res_ir_reg
+                        res_type = fn.value_type
+                        res_ir_reg = generate_extern_call_ir(generator, get_fn_name("cnv", res_type, a_type),
+                            res_type, [a_type, a_ir_reg])
+                        
+                    generator.llvmir.builder.ret(res_ir_reg)
+
+            elif (node.children[0].value == "break"):
+                generator.llvmir.builder.branch(generator.llvmir.break_bb)
+                
+            elif (node.children[0].value == "continue"):
+                generator.llvmir.builder.branch(generator.llvmir.continue_bb)
+
+            else:
+                # XXX Missing goto
+                assert False, "Unsupported jump_statement %s" % repr(node)
+
+            # XXX Null gen_node in this and others?
+
         elif (node.data == "init_declarator_list"):
             # init_declarator_list:  init_declarator
             # |  init_declarator_list "," init_declarator 
@@ -1076,42 +1205,18 @@ def generate_ir(generator, node):
             block = generator.llvmir.function.append_basic_block("entry")
             generator.llvmir.builder = ir.IRBuilder(block)
 
-            # Link the parameters to the ir builder function arguments, generate
-            # alloca as early as possible to prevent from happening later in a
-            # basic block but trying to be consumed on a disjoint basic block
+            # Link the parameters to the ir builder function arguments
             for parameter, arg in zip(parameters, generator.llvmir.function.args):
                 parameter.ir_reg = arg
-                parameter.ir_ref = generator.llvmir.builder.alloca(get_llvmlite_type(parameter.value_type))
-                generator.llvmir.builder.store(parameter.ir_reg, parameter.ir_ref)
 
             # Generate the function's body
             gen_node = generate_ir(generator, node.children[-1])
 
             if (gen_node == "}"):
-                # Empty function
-                fn.ir = Struct(type="ir", value_type="void", ir_reg=None)
-            else:
-                fn.ir = gen_node
-
-            # If the return type is different from the block type, convert
-            if (fn.value_type != fn.ir.value_type):
-                a_type = fn.ir.value_type
-                a_ir_reg = fn.ir.ir_reg
-                res_type = fn.value_type
-                res_ir_reg = generate_extern_call_ir(generator, get_fn_name("cnv", res_type, a_type),
-                    res_type, [a_type, a_ir_reg])
-                
-                fn.ir = Struct(type="ir", value_type=res_type, ir_reg=res_ir_reg)
-                
-            # Now really return the value
-            res_ir_reg = fn.ir.ir_reg
-            res_type = fn.ir.value_type
-            if (fn.value_type == "void"):
+                # Empty function, put a return void so LLVM doesn't error out on
+                # an empty block
                 generator.llvmir.builder.ret_void()
-
-            else:
-                generator.llvmir.builder.ret(res_ir_reg)
-
+            
             fn.llvm_irs = str(generator.llvmir.function).splitlines()
             do_reindexing = False
             if (do_reindexing):
@@ -1190,10 +1295,7 @@ def generate_ir(generator, node):
                     # Value_reg and value_ref will be assigned on usage
                 )
                 generator.symbol_table[identifier] = variable
-                # Create an allocation as soon as possible so it's available
-                # in disjoint basic blocks
-                variable.ir_ref = generator.llvmir.builder.alloca(get_llvmlite_type(variable.value_type))
-            
+                
                 if (initializer is not None):
                     # XXX This should come from gen_node instead of having
                     #     to recreate it here?
@@ -1268,6 +1370,190 @@ def generate_ir(generator, node):
             res_type = get_tree_tokens(node)
             res_type = string.join(res_type, " ")
             gen_node = res_type
+
+        elif (node.data == "iteration_statement"):
+            # iteration_statement:  "while" "(" expression ")" statement
+            # |  "do" statement "while" "(" expression ")" ";"
+            # |  "for" "(" expression? ";" expression? ";" expression? ")" statement
+            # |  "for" "(" declaration expression? ";" expression? ")" statement
+            if (node.children[0] == "while"):
+                # iteration_statement:  "while" "(" expression ")" statement
+
+                builder = generator.llvmir.builder
+                loop_cond_bb = builder.function.append_basic_block("whilecond")
+                loop_end_bb = builder.function.append_basic_block("whileend")
+                loop_body_bb = builder.function.append_basic_block("whilebody")
+
+                # Save old break/continue, set new
+                prev_break_bb = generator.llvmir.break_bb
+                prev_continue_bb = generator.llvmir.continue_bb 
+                generator.llvmir.break_bb = loop_end_bb
+                generator.llvmir.continue_bb = loop_cond_bb
+
+                # Jump to the condition
+                generator.llvmir.builder.branch(loop_cond_bb)
+                
+                # Generate loop condition
+                generator.llvmir.builder.position_at_start(loop_cond_bb)
+                gen_node = generate_ir(generator, node.children[2])
+                # Convert expression to _Bool
+                a_ir_reg, a_type = get_ir_reg_and_type(gen_node)
+                res_type = "_Bool"
+                if (a_type != res_type):
+                    a_ir_reg = generate_extern_call_ir(generator, 
+                        get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_ir_reg])
+
+                # Jump to exit or to start of loop
+                generator.llvmir.builder.cbranch(a_ir_reg, loop_body_bb, loop_end_bb)
+
+                # Generate loop body
+                generator.llvmir.builder.position_at_start(loop_body_bb)
+                generate_ir(generator, node.children[4])
+                generator.llvmir.builder.branch(loop_cond_bb)
+
+                # Restore old break/continue
+                generator.llvmir.break_bb = prev_break_bb
+                generator.llvmir.continue_bb = prev_continue_bb
+
+                # Generate the end
+                generator.llvmir.builder.position_at_start(loop_end_bb)
+
+            elif (node.children[0] == "do"):
+                # |  "do" statement "while" "(" expression ")" ";"
+
+                builder = generator.llvmir.builder
+                loop_cond_bb = builder.function.append_basic_block("docond")
+                loop_body_bb = builder.function.append_basic_block("dobody")
+                loop_end_bb = builder.function.append_basic_block("doend")
+
+                # Save old break/continue, set new
+                prev_break_bb = generator.llvmir.break_bb
+                prev_continue_bb = generator.llvmir.continue_bb 
+                generator.llvmir.break_bb = loop_end_bb
+                generator.llvmir.continue_bb = loop_cond_bb
+
+                # Jump to the loop body
+                generator.llvmir.builder.branch(loop_body_bb)
+
+                # Generate loop body
+                generator.llvmir.builder.position_at_start(loop_body_bb)
+                generate_ir(generator, node.children[1])
+                generator.llvmir.builder.branch(loop_cond_bb)
+
+                # Generate loop condition
+                generator.llvmir.builder.position_at_start(loop_cond_bb)
+                gen_node = generate_ir(generator, node.children[4])
+                # Convert expression to _Bool
+                a_ir_reg, a_type = get_ir_reg_and_type(gen_node)
+                res_type = "_Bool"
+                if (a_type != res_type):
+                    a_ir_reg = generate_extern_call_ir(generator, 
+                        get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_ir_reg])
+
+                # Jump to exit or to start of loop
+                generator.llvmir.builder.cbranch(a_ir_reg, loop_body_bb, loop_end_bb)
+
+                # Restore old break/continue
+                generator.llvmir.break_bb = prev_break_bb
+                generator.llvmir.continue_bb = prev_continue_bb
+
+                # Generate the end
+                generator.llvmir.builder.position_at_start(loop_end_bb)
+
+            elif (node.children[0] == "for"):
+                # |  "for" "(" expression? ";" expression? ";" expression? ")" statement
+                # |  "for" "(" declaration expression? ";" expression? ")" statement
+
+                # The foor loop creates a scope for the declaration that sits
+                # between the parent scope and the body scope, those
+                # declarations can hide and be hidden, but there's no collision
+                # with one or the other
+                generator.symbol_table.push_scope()
+
+                # Skip over for and (
+                next_child = 2
+
+                # Generate the loop setup
+                if (node.children[next_child] != ";"):
+                    # Declaration or expression, note declaration includes the
+                    # initializer and ";" already
+                    gen_node = generate_ir(generator, node.children[next_child])
+                    
+                    if (node.children[next_child].data == "expression"):
+                        next_child += 1
+
+                # Skip over ;
+                next_child += 1
+                    
+                generator.symbol_table.push_scope()
+                
+                builder = generator.llvmir.builder
+
+                loop_cond_bb = builder.function.append_basic_block("forcond")
+                loop_incr_bb = builder.function.append_basic_block("forincr")
+                loop_body_bb = builder.function.append_basic_block("forbody")
+                loop_end_bb = builder.function.append_basic_block("forend")
+
+                # Save old break / continue, set new
+                prev_break_bb = generator.llvmir.break_bb
+                prev_continue_bb = generator.llvmir.continue_bb 
+                generator.llvmir.break_bb = loop_end_bb
+                generator.llvmir.continue_bb = loop_incr_bb
+
+                generator.llvmir.builder.branch(loop_cond_bb)
+                
+                generator.llvmir.builder.position_at_start(loop_cond_bb)
+                if (node.children[next_child] != ";"):
+                    # Generate the loop condition
+                    
+                    gen_node = generate_ir(generator, node.children[next_child])
+
+                    # Convert expression to _Bool
+                    a_ir_reg, a_type = get_ir_reg_and_type(gen_node)
+                    res_type = "_Bool"
+                    if (a_type != res_type):
+                        a_ir_reg = generate_extern_call_ir(generator, 
+                            get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_ir_reg])
+
+                    # Jump to exit or to start of loop
+                    generator.llvmir.builder.cbranch(a_ir_reg, loop_body_bb, loop_end_bb)
+                    next_child += 1
+
+                else:
+                    generator.llvmir.builder.branch(loop_body_bb)
+                
+                # Skip over ;
+                next_child += 1
+
+                generator.llvmir.builder.position_at_start(loop_incr_bb)
+                if (node.children[next_child] != ")"):
+                    # Generate the loop increment
+                    gen_node = generate_ir(generator, node.children[next_child])
+
+                    next_child += 1
+                generator.llvmir.builder.branch(loop_cond_bb)
+
+                next_child += 1
+
+                # Generate the for body 
+                generator.llvmir.builder.position_at_start(loop_body_bb)
+                generate_ir(generator, node.children[next_child])
+                generator.llvmir.builder.branch(loop_incr_bb)
+                
+                # Generate the end
+                generator.llvmir.builder.position_at_start(loop_end_bb)
+
+                # Restore old break/continue
+                generator.llvmir.break_bb = prev_break_bb
+                generator.llvmir.continue_bb = prev_continue_bb
+
+                # for body
+                generator.symbol_table.pop_scope()
+                # for declaration
+                generator.symbol_table.pop_scope()
+
+            else:
+                assert False, "Unsupported iteration statement %s" % node
 
         elif (node.data == "selection_statement"):
             # selection_statement:  "if" "(" expression ")" statement
@@ -1437,6 +1723,17 @@ def llvm_compile(llvm_ir, function_signatures):
     jit_lib.engine = engine
     jit_lib.asm = target_machine.emit_assembly(mod)
     jit_lib.ir = str(mod)
+
+    output_dot = True
+    output_optimized_dot = True
+    if (output_dot):
+        for function_signature in function_signatures:
+            func = mod.get_function(function_signature.name)
+            dot = llvm.get_function_cfg(func, show_inst=True)
+            dot_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_out", function_signature.name + ".dot")
+            with open(dot_filepath, "w") as f:
+                f.write(dot)
+            invoke_dot(dot_filepath)
     
     
     # Optimize the module
@@ -1452,6 +1749,14 @@ def llvm_compile(llvm_ir, function_signatures):
 
         # Look up the function pointer (a Python int)
         func_ptr = engine.get_function_address(function_signature.name)
+
+        if (output_optimized_dot):
+            func = mod.get_function(function_signature.name)
+            dot = llvm.get_function_cfg(func, show_inst=True)
+            dot_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_out", function_signature.name + ".optimized.dot")
+            with open(dot_filepath, "w") as f:
+                f.write(dot)
+            invoke_dot(dot_filepath)
 
         # Run the function via ctypes
         cfunc = ctypes.CFUNCTYPE(*function_signature.ctypes)(func_ptr)
@@ -1524,7 +1829,7 @@ def epycc_generate(source, debug = False):
 
     generator = Struct(
         symbol_table = SymbolTable(), 
-        llvmir = Struct(module=ir.Module(), function=None, externs=dict())
+        llvmir = Struct(module=ir.Module(), break_bb = None, continue_bb = None, function=None, externs=dict())
     )
     
     generate_ir(generator, tree)
@@ -1588,6 +1893,367 @@ def epycc_compile(source, debug = False):
 
 
 
+def llvm_ir_diff(filepath_a, filepath_b, function_names = None):
+    """
+    IR file differ. Tries to find a remapping of namedvalues between a and b 
+    and reordering of phi instructions and reshuffling of phi parameters to
+    prevent false mismatches.
+
+    Starts with the initial blocks and works its way from there.
+
+
+    This uses llvm.bindings assembler parsing functionality, but note that
+    default names for namedvalues (eg coming from clang) don't appear as .name
+    attribute, eg the parameters and destination and operand registers have an
+    empty .name. For non-default names (Eg coming from epycc) they do appear.
+
+    str(instruction) or str(operand) does show the namedvalue.
+
+    XXX Maybe a solution is manually convert all %n default names to "%n" before
+        or after loading.
+
+
+    It also does phi attribute shuffling to prevent mismatches due to different
+    ordering between a and b.
+    
+
+    Also does phi instruction reordering to cater for the following false
+    mismatch in this case from ffor_nested
+
+        ; <label>:4:                                      ; preds = %27, %2
+        %5 = phi i32 [ %34, %27 ], [ -4, %2 ]
+        %6 = phi i32 [ %33, %27 ], [ -1, %2 ]
+        %7 = phi i32 [ %32, %27 ], [ 0, %2 ]
+        %8 = phi i32 [ %30, %27 ], [ 0, %2 ]
+        %9 = phi i32 [ %29, %27 ], [ 0, %2 ]
+        %10 = lshr i32 %6, 3
+        %11 = icmp eq i32 %8, 0
+        br i1 %11, label %27, label %12
+
+         vs. 
+
+        forcond.1.preheader:                              ; preds = %forend.1, %entry
+        %indvars.iv10 = phi i32 [ %indvars.iv.next11, %forend.1 ], [ -4, %entry ]
+        %indvars.iv8 = phi i32 [ %indvars.iv.next9, %forend.1 ], [ -1, %entry ]
+        %indvars.iv = phi i32 [ %indvars.iv.next, %forend.1 ], [ 0, %entry ]
+        %.4.05 = phi i32 [ %13, %forend.1 ], [ 0, %entry ]
+        %.7.03 = phi i32 [ %14, %forend.1 ], [ 0, %entry ]
+        %1 = lshr i32 %indvars.iv8, 3
+        %2 = icmp eq i32 %.7.03, 0
+        br i1 %2, label %forend.1, label %forbody.1.preheader
+
+        those two snippets are equivalent but the phi instructions are sorted 
+        differently because they are independent, specifically 
+
+            %8 = phi i32 [ %30, %27 ], [ 0, %2 ]
+            %9 = phi i32 [ %29, %27 ], [ 0, %2 ]
+
+        and 
+            %.4.05 = phi i32 [ %13, %forend.1 ], [ 0, %entry ]
+            %.7.03 = phi i32 [ %14, %forend.1 ], [ 0, %entry ]
+
+
+        Looks like the phi instructions can be sorted by looking at the source
+        value of the value,label pair. The epycc generated doesn't have a 
+        monotonically increasing value to sort by (although this is irrelevant, 
+        you could also sort both clang and epycc phi instructions by looking
+        at the , and could use the remapping
+        value instead, but the remapping must not come from a phi node or
+        it could have been remapped wrongly already.
+
+        XXX The bad option is to try all register naming combinations or instruction
+            orderings.
+
+        XXX Looks like this sorting could be applied to any instruction, disregarding
+            the data hazards between instructions since we only care about finding
+            a mapping between both sets of instructions.
+
+        XXX Should the reordering care about data hazards? Yes in the general
+            case not when comparing against default naming file? (because default
+            naming guarantees montonically increasing registers so any remapping 
+            would also guarantee it?)
+            
+    """
+
+    def search_block(block_str, blocks):
+        block = block_str_to_block.get(block_str, None)
+        if (block is None):
+            for block in blocks:
+                if (block_str == str(block)):
+                    block_str_to_block[block_str] = block
+                    break
+                
+        return block
+        
+    def sort_phi_operands(tokens, remap_sort, remap_result):
+        # XXX This accesses the remapping table, should be passed as param?
+        phi_operands = [ tokens[4+i*4:4+(i+1)*4] for i in (xrange((len(tokens) - 4) / 4)) ]
+        if (remap_sort):
+            phi_operands = sorted(phi_operands, key= lambda a: [remapping_table[i] for i in a])
+        else:
+            phi_operands = sorted(phi_operands)
+
+        if (remap_result):
+            phi_operands = [remapping_table[item] for sublist in phi_operands for item in sublist]
+
+        else:
+            phi_operands = [item for sublist in phi_operands for item in sublist]
+
+        return phi_operands
+        
+    def sort_instructions(instructions, remapping_table=None):
+
+        def cmp_instructions(i0, i1):
+            """
+            Compare two (index, instruction) pairs in order to be sorted.
+
+            Normal instructions will be first in the list, then remapped phis,
+            then unremapped phis. If remap is False then all instructions are
+            considered remapped.
+
+            Right now this does special casing for phi instructions, the other
+            instructions are compared verbatim.
+            """
+            remap = (remapping_table is not None)
+
+            i0_i, instr0 = i0
+            i1_i, instr1 = i1
+            str_instr0 = str(instr0).strip()
+            str_instr1 = str(instr1).strip()
+            tokens0 = re.split(r"[ ,]+", str_instr0)
+            tokens1 = re.split(r"[ ,]+", str_instr1)
+            
+            res = 0
+            
+            # Sort normal instructions first, then remapped phis, then
+            # unremapped phis (note in all a instructions are considered
+            # remapped)
+            if ((instr0.opcode == "phi") and (instr1.opcode == "phi")):
+                lacks_remappings0 = lacks_remappings1 = False
+                if (remap):
+                    lacks_remappings0 = any([token not in remapping_table for token in tokens0])
+                    lacks_remappings1 = any([token not in remapping_table for token in tokens1])
+
+                if (lacks_remappings0 and lacks_remappings1):
+                    res = cmp(i0_i, i1_i)
+                
+                elif (lacks_remappings0):
+                    res = 1
+                
+                elif (lacks_remappings1):
+                    res = -1
+
+                else:
+                    
+                    # Order depending on alphabetically sorted operands 
+                    # XXX This could also check the return type and/or the
+                    #     destination register
+                    phi_operands0 = sort_phi_operands(tokens0, remap, remap)
+                    phi_operands1 = sort_phi_operands(tokens1, remap, remap)
+
+                    res = cmp(phi_operands0, phi_operands1)
+                    # print "comparing", phi_operands0, "vs", phi_operands1
+                    assert(res != 0)
+                    
+            elif (instr0.opcode == "phi"):
+                res = 1
+
+            elif (instr1.opcode == "phi"):
+                res = -1
+
+            else:
+                res = cmp(i0_i, i1_i)             
+
+            return res
+
+        index_instructions = [ (i, item) for i, item in enumerate(instructions)]
+        instructions_sorted = [item for i, item in sorted(index_instructions, cmp=cmp_instructions)]
+        
+        return instructions_sorted
+
+
+    mismatch_count = 0
+    # tuples of a,b instructions mismatching, indexed by function name
+    mismatches = {}
+
+    with open(filepath_a, "r") as f:
+        llvm_ir_a = f.read()
+
+    with open(filepath_b, "r") as f:
+        llvm_ir_b = f.read()
+
+    mod_a = llvm.parse_assembly(llvm_ir_a)
+    mod_b = llvm.parse_assembly(llvm_ir_b)
+
+    fns_a = {}
+    fns_b = {}
+    
+    if (function_names is not None):
+        if (isinstance(function_names, str)):
+            function_names = [function_names]
+        function_names = set(function_names)
+
+    for fn_a in mod_a.functions:
+        if ((function_names is not None) and (fn_a.name not in function_names)):
+            continue
+
+        # look for the function in b, note this won't return as diffs the
+        # functions in b not present in a
+        for fn_b in mod_b.functions:
+            if (fn_a.name == fn_b.name):
+                break
+        else:
+            # fn_a doesn't exist in b, add each instruction to the mismatch
+            # XXX Note this will contain comments and the function header, which
+            #     will be different from when the function is found?
+            mismatches[fn_a.name] = [instr for instr in str(fn_a).splitlines()]
+            continue
+            
+        function_mismatch_count = 0
+        mismatches[fn_a.name] = []
+
+        # Get the entry blocks
+        block_a = list(fn_a.blocks)[0]
+        block_b = list(fn_b.blocks)[0]
+
+        # XXX Should this abort if the number of arguments or the return type 
+        #     is already different?
+        assert(len(list(fn_a.arguments)) == len(list(fn_b.arguments)))
+        
+        # Add the function arguments to the remapping table
+        remapping_table = {
+            "%%%s" % argument_b.name if (argument_b.name != "") else "%%%d" % i :
+            "%%%s" % argument_a.name if (argument_a.name != "") else "%%%d" % i 
+                for i, (argument_a, argument_b) in enumerate(zip(fn_a.arguments, fn_b.arguments))
+        }
+        
+        # Add the initial block to the remapping table, this may appear in 
+        # labels but not in a label declaration if the IR uses default naming
+        block_name_a = block_a.name if (block_a.name != "") else "%%%d" % len(list(fn_a.arguments))
+        block_name_b = block_b.name if (block_b.name != "") else "%%%d" % len(list(fn_a.arguments))
+        remapping_table["%%%s" % block_name_b] = block_name_a
+
+        # Block cache for searches
+        block_str_to_block = dict()
+
+        pending_block_pairs_queue = [(block_a, block_b)]
+        done_block_pairs = set()
+        while (len(pending_block_pairs_queue) > 0):
+            block_pair = pending_block_pairs_queue.pop(0)
+            done_block_pairs.add(block_pair)
+            block_a, block_b = block_pair
+            instructions_a = block_a.instructions
+            instructions_b = block_b.instructions
+
+            # Create a list to be sorted with [(index, instruction_a, instruction_b), ...] 
+            # Reorder the phi instructions wrt to a sort func
+            
+            instructions_sorted_a = sort_instructions(instructions_a)
+            instructions_sorted_b = sort_instructions(instructions_b, remapping_table)
+
+            needs_revisiting = False
+            # Fill with empty strings so they are detected as mismatches
+            # Note this works because it gets handled as different token lengths
+            delta_len_a_b = len(instructions_sorted_a) - len(instructions_sorted_b)
+            instructions_sorted_b.extend([""] * (max(delta_len_a_b, 0)))
+            instructions_sorted_a.extend([""] * (max(-delta_len_a_b, 0)))
+            for instr_a, instr_b in zip(instructions_sorted_a, instructions_sorted_b):
+                str_instr_a = str(instr_a).strip()
+                str_instr_b = str(instr_b).strip()
+                tokens_a = re.split(r"[ ,]+", str_instr_a)
+                tokens_b = re.split(r"[ ,]+", str_instr_b)
+
+                if ((len(tokens_a) != len(tokens_b)) or 
+                    (instr_a.opcode != instr_b.opcode) or 
+                    ((instr_a.opcode != "phi") and any([token_a != token_b 
+                        for token_a, token_b in zip(tokens_a, tokens_b) if not token_b.startswith("%")]))):
+                    function_mismatch_count += 1
+                    mismatches[fn_a.name].append((str_instr_a, str_instr_b))
+                    continue
+
+                remapping_table.update({token_b : token_b for token_b in tokens_b if token_b[0] != "%"})
+
+                # Phi instructions 
+                #   %indvars.iv10 = phi i32 [ %indvars.iv.next11, %forend.1 ], [ -4, %entry ]
+                # select over depending on where it came from
+                # the selection options can be randomly sorted, so we need
+                # to ensure they are compared properly.
+                
+                # If it's a phi node, reorder the options tokens
+                # alphabetically wrt the remapping, this requires the
+                # remapping to be available for those options
+
+                # ['%10', '=', 'phi', 'i32', '[', '%5', '%4', ']', '[', '%8', '%7', ']']
+                # ['%merge', '=', 'phi', 'i32', '[', '%2', '%dobody.endif', ']', '[', '%.4.0', '%dobody', ']']
+                if (instr_a.opcode == "phi"):
+                    # If not all the tokens are in the remapping table, put
+                    # the block back in the queue to revisit later
+                    
+                    # XXX This needs to check for infinite loops?
+                    if (any([token_b not in remapping_table for token_b in tokens_b])):
+                        needs_revisiting = True
+                        continue
+
+                    else:
+                        phi_operands_a = sort_phi_operands(tokens_a, False, False)
+                        phi_operands_b = sort_phi_operands(tokens_b, True, False)
+
+                        tokens_a = tokens_a[:4] + phi_operands_a
+                        tokens_b = tokens_b[:4] + phi_operands_b
+
+                mismatch_found = False
+                for token_a, token_b in zip(tokens_a, tokens_b):
+                    if (token_b in remapping_table):
+                        if (remapping_table[token_b] != token_a):
+                            mismatch_found = True
+                            break
+                        
+                    else:
+                        remapping_table[token_b] = token_a
+
+                if (mismatch_found):
+                    # There was a mismatch, done with this instruction
+                    function_mismatch_count += 1
+                    mismatches[fn_a.name].append((str(instr_a), str(instr_b)))
+
+                    continue
+
+                # Find other blocks to traverse by pushing to the queue operands
+                # of type "label"
+                for operand_a, operand_b in zip(instr_a.operands, instr_b.operands):
+                    # instr.opcode is a string with the opcode, but has information
+                    # missing, eg "icmp" for "icmp gte" 
+
+                    # str(operand) returns type and name, but name is empty for auto-gen
+                    # for labels, the str() gives the full basic block the label 
+                    # points to
+
+                    if (str(operand_a.type) == "label"):
+                        # Find the block by string search
+                        next_block_a = search_block(str(operand_a), fn_a.blocks)
+                        next_block_b = search_block(str(operand_b), fn_b.blocks)
+                        
+                        assert(next_block_a is not None)
+                        assert(next_block_b is not None)
+                        
+                        next_block_pair = (next_block_a, next_block_b)
+                        if (next_block_pair not in done_block_pairs):
+                            pending_block_pairs_queue.append(next_block_pair)
+
+            # Re-enqueue if this block needs revisiting, but don't do it if
+            # there are mismatches since it could prevent completing the
+            # remapping table and loop forever
+            if (needs_revisiting and (function_mismatch_count == 0)):
+                # XXX This could remove the completely remapped instructions
+                #     from the block
+                done_block_pairs.remove(block_pair)
+                pending_block_pairs_queue.append(block_pair)
+
+        mismatch_count += function_mismatch_count
+
+    return mismatches
+
+
 if (__name__ == "__main__"):
     source = open("samples/current.c").read()
     lib = epycc_compile(source, True)
@@ -1595,4 +2261,4 @@ if (__name__ == "__main__"):
     print lib.ir_optimized
     #print lib.asm
     #print lib.asm_optimized
-    print lib.f2pow2(2)
+    print lib.ffor_nested(10, 20)
