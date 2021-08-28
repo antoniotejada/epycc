@@ -52,4 +52,28 @@ int fwhile_return(int a, int b) {
     return s;
 }
 
+// Test that we silently ignore branches on terminated basic blocks (the if condition
+// will try to branch but that basic block already has a break branch)
+int fwhile_terminated_cbranch(int a, int b) {
+    while (1) {
+        break;
+        if (a == 1) {
+
+        } 
+    }
+    return b;
+}
+
+// Test that we silently ignore branches on terminated basic blocks (the if/then
+// will try to branch to the end of the if but it has already been terminated
+// by the break)
+int fwhile_terminated_branch(int a, int b) {
+    while (1) {
+        if (a == 1) {
+            break;
+        } 
+    }
+    return b;
+}
+
 // XXX Nest whiles

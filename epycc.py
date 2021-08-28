@@ -110,8 +110,16 @@ class SymbolTable():
         # redefine them in a nested scope)
         self.scope_symbols = [dict(), dict()]
 
+    def get(self, key, default):
+        # XXX Do this without exceptions
+        try:
+            return self.__getitem__(key)
+
+        except KeyError:
+            return default
 
     def __getitem__(self, key):
+        assert isinstance(key, str)
         item = None
         # Search the item in all the scopes, except for overflow
         for symbols in reversed(self.scope_symbols[:-1]):
@@ -308,7 +316,7 @@ def invoke_clang(c_filepath, ir_filepath, options=""):
     clang_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_out", "clang.exe")
     # For privacy reasons and since some ir files are pushed to the repo, don't
     # leak the local path in the LLVM moduleid comment of 
-    cmd = R"%s -mllvm --x86-asm-syntax=intel -S -std=c99 -emit-llvm %s -o %s %s" % (
+    cmd = R"%s -S -std=c99 -emit-llvm -mllvm --x86-asm-syntax=intel %s -o %s %s" % (
         clang_filepath,
         options,
         os.path.relpath(ir_filepath),
@@ -608,6 +616,9 @@ def convert_to_clang_irs(llvm_irs):
     
 
 def generate_ir(generator, node):
+    # XXX This should have a generate_ir and then a nested function
+    #     generate_node_ir that doesn't require passing the generator every time
+
     def get_grandson(node, parent_indices):
         if (len(parent_indices) > 0):
             node = get_grandson(node.children[parent_indices[0]], parent_indices[1:])
@@ -806,32 +817,42 @@ def generate_ir(generator, node):
     def get_ir_ref_reg_and_type(a):
         # XXX This is wrong in the case of lvalues of complex expressions 
         #     (pointers, arrays, structs...)
+        # XXX This is old code that probably doesn't make sense with llvmlite ir
+        #     builders, all the variables have a ref
         
         # Get reg and type to deal with allocations
         get_ir_reg_and_type(a)
 
         a = generator.symbol_table[a.value]
-        assert a.type == "variable"
+        assert ((a.type == "variable") or (a.type == "parameter"))
 
         return a.ir_ref, a.ir_reg, a.value_type
 
     def get_ir_reg_and_type(a):
         if (a.type == "identifier"):
-            a = generator.symbol_table[a.value]
-            a_type = a.value_type
+            sym = generator.symbol_table[a.value]
+            a_type = sym.value_type
             a_ir_type = get_llvmlite_type(a_type)
 
-            if (not hasattr(a, "ir_ref")):
+            if (not hasattr(sym, "ir_ref")):
                 # Always create allocas in entry block so they are available
                 # everywhere even across disjoint basic blocks and don't get
                 # reallocated inside loops, etc
                 with generator.llvmir.builder.goto_entry_block():
-                    a.ir_ref = generator.llvmir.builder.alloca(a_ir_type)
+                    sym.ir_ref = generator.llvmir.builder.alloca(a_ir_type)
                 
-                # If it has a register it means that it has an initial value, 
-                # copy from the register into the storage
-                if (hasattr(a, "ir_reg")):
-                    generator.llvmir.builder.store(a.ir_reg, a.ir_ref)
+                    # If it has a register it means that it has an initial value, 
+                    # copy from the register into the storage
+                    
+                    # Note only parameters have an ir_reg without an ir_ref.
+                    # Initialized variables will get the alloca correctly
+                    # bubbled up, but the expression and assign initializing
+                    # them will remain in the disjoint basic block
+
+                    # XXX Should things get reset on every basic block?
+                    if (hasattr(sym, "ir_reg")):
+                        assert(sym.type == "parameter")
+                        generator.llvmir.builder.store(sym.ir_reg, sym.ir_ref)
 
             # Load from the storage to a new register to make sure the register
             # value we use is uptodate            
@@ -845,8 +866,8 @@ def generate_ir(generator, node):
             #     content like ir_reg since it may be created in one basic block
             #     and not available on another (eg regs created in a "then" block
             #     are not available on "else" blocks)
-            a.ir_reg = generator.llvmir.builder.load(a.ir_ref)
-            a_ir_reg = a.ir_reg
+            sym.ir_reg = generator.llvmir.builder.load(sym.ir_ref)
+            a_ir_reg = sym.ir_reg
             
         elif (a.type == "constant"):
             a_type = a.value_type
@@ -858,6 +879,95 @@ def generate_ir(generator, node):
             a_type = a.value_type
 
         return a_ir_reg, a_type
+
+    def create_function(function_name, function_type, parameters):
+        fn = Struct(
+            type = "function", 
+            name=function_name, 
+            value_type=function_type, 
+            parameters=parameters
+        )
+
+        # Create the function in the IR builder
+        fn_llvmlite_type = ir.FunctionType(
+            get_llvmlite_type(function_type), 
+            [get_llvmlite_type(parameter.value_type) for parameter in parameters]
+        )
+        
+        fn.ir = ir.Function(generator.llvmir.module, fn_llvmlite_type, name=function_name)
+
+        return fn
+        
+    def goto_unreachable_block():
+        """
+        Switch to an unrechable basic block to prevent errors if code is added
+        after the return. Note this can happen because of adding unreachable
+        code,eg
+
+            break;
+            a = 1;
+
+        A special case of the same problem is adding branches, which will cause
+        llvmlite IR to error because of trying to add two terminators. This happens
+        in well-formed code likethis because the ifthen will try to branch to
+        ifend, but that block already has a return terminator.
+
+            int fdo_return(int a, int b) {
+                int s = 0;
+                do {
+                    if (s > 1000) {
+                        return s;
+                    }
+                    s += a;
+                } while (a > b);
+
+                return s;
+            }
+
+        Note this block will be discarded and not even compiled in unoptimized
+        code.
+        """
+        notreached_bb = generator.llvmir.builder.function.append_basic_block("notreached")
+        generator.llvmir.builder.position_at_start(notreached_bb)
+
+
+    def generate_branch_ir(target):
+        """
+        Utility function to trap branches on terminated blocks. This should 
+        never happen since we use an unreachable block, see goto_unreachable_block
+        """
+        if (generator.llvmir.builder.block.is_terminated):
+            print "Trying to terminate already terminated block"
+            print str(generator.llvmir.builder.block)
+            print "to" 
+            print str(target)
+            print "in function"
+            print str(generator.llvmir.builder.function)
+
+            assert False
+
+        else:
+            generator.llvmir.builder.branch(target)
+                
+    def generate_cbranch_ir(condition, target_true, target_false):
+        """
+        Utility function to trap cbranches on terminated blocks. This should 
+        never happen since we use an unreachable block, see goto_unreachable_block
+        """
+        if (generator.llvmir.builder.block.is_terminated):
+            print "Trying to terminate already terminated block"
+            print str(generator.llvmir.builder.block)
+            print "to" 
+            print str(target_true),
+            print "with condition", str(condition)
+            print "in function"
+            print str(generator.llvmir.builder.function)
+
+            assert False
+
+        else:
+            generator.llvmir.builder.cbranch(condition, target_true, target_false)
+
 
     def generate_extern_call_ir(generator, fn_name, res_type, arg_type_ir_regs):
             
@@ -878,6 +988,27 @@ def generate_ir(generator, node):
         res_ir_reg = generator.llvmir.builder.call(fn_ir, arg_ir_regs)
 
         return res_ir_reg
+
+    def generate_call_ir(generator, fn_name, arg_ir_reg_types):
+        
+        fn = generator.symbol_table[fn_name]
+
+        arg_ir_regs = []
+        for (arg_ir_reg, arg_type), parameter in zip(arg_ir_reg_types, fn.parameters):
+            # Convert each argument to the parameter type
+            if (arg_type != parameter.value_type):
+                arg_ir_reg = generate_extern_call_ir(generator, 
+                    get_fn_name("cnv", parameter.value_type, arg_type), 
+                    parameter.value_type, 
+                    [arg_type, arg_ir_reg]
+                )
+            
+            arg_ir_regs.append(arg_ir_reg)
+        
+        res_type = fn.value_type
+        res_ir_reg = generator.llvmir.builder.call(fn.ir, arg_ir_regs)
+
+        return res_ir_reg, res_type
 
     def generate_assign_ir(generator, a, b):
         a_ir_ref, a_ir_reg, a_type = get_ir_ref_reg_and_type(a)
@@ -969,6 +1100,16 @@ def generate_ir(generator, node):
             gen_node = generate_ir(generator, node.children[1])
             generator.symbol_table.pop_scope()
 
+        elif (node.data == "argument_expression_list"):
+            # argument_expression_list:  assignment_expression
+            # |  argument_expression_list "," assignment_expression
+            # XXX Should unify all the _list?
+            if (len(node.children) == 1):
+                gen_node = [generate_ir(generator, node.children[0])]
+            else:
+                gen_node = generate_ir(generator, node.children[0])
+                gen_node.append(generate_ir(generator, node.children[2]))
+
         elif (node.data == "postfix_expression"):
             # postfix_expression:  primary_expression
             # |  postfix_expression "[" expression "]"
@@ -989,6 +1130,25 @@ def generate_ir(generator, node):
                 
                 op_sign = node.children[1][0]
                 gen_node = generate_incr_ir(generator, gen_node, op_sign, True)
+
+            elif (node.children[1] == "("):
+                # |  postfix_expression "(" argument_expression_list? ")"
+                # Function call
+                gen_node = generate_ir(generator, node.children[0])
+                # XXX This only supports straight identifiers, no function pointer
+                #     expressions
+                assert (gen_node.type == "identifier")
+
+                fn_name = gen_node.value
+                
+                arg_ir_reg_types = []
+                if (node.children[2] != ")"):
+                    # Collect parameters
+                    gen_node = generate_ir(generator, node.children[2])
+                    arg_ir_reg_types = [get_ir_reg_and_type(a) for a in gen_node]
+
+                res_ir_reg, res_type = generate_call_ir(generator, fn_name, arg_ir_reg_types)
+                gen_node = Struct(type="ir", value_type=res_type, ir_reg=res_ir_reg)
 
             else:
                 # XXX Support the rest of postfix_expression
@@ -1123,12 +1283,16 @@ def generate_ir(generator, node):
                             res_type, [a_type, a_ir_reg])
                         
                     generator.llvmir.builder.ret(res_ir_reg)
-
+                
+                goto_unreachable_block()
+                
             elif (node.children[0].value == "break"):
-                generator.llvmir.builder.branch(generator.llvmir.break_bb)
+                generate_branch_ir(generator.llvmir.break_bb)
+                goto_unreachable_block()
                 
             elif (node.children[0].value == "continue"):
-                generator.llvmir.builder.branch(generator.llvmir.continue_bb)
+                generate_branch_ir(generator.llvmir.continue_bb)
+                goto_unreachable_block()
 
             else:
                 # XXX Missing goto
@@ -1173,49 +1337,53 @@ def generate_ir(generator, node):
             gen_node = generate_ir(generator, node.children[1])
             function_name = gen_node[0].value
 
-            # Collect parameters, note they could be empty or just one
-            parameters = []
-            parameter_nodes = gen_node[2]
-            if (parameter_nodes != ")"):
-                if (not isinstance(parameter_nodes, list)):
-                    parameter_nodes = [parameter_nodes]
-                for parameter_node in parameter_nodes:
-                    # [{value_reg: 0, value... variable}, ',', {value_reg: 1, value... variable}]
-                    if (parameter_node != ","):
-                        parameters.append(parameter_node)
-                        
-            fn = Struct(
-                type = "function", 
-                name=function_name, 
-                value_type=function_type, 
-                parameters=parameters
-            )
-            generator.symbol_table[function_name] = fn
-
-            # Create the function in the IR builder
-            fn_llvmlite_type = ir.FunctionType(
-                get_llvmlite_type(function_type), 
-                [get_llvmlite_type(parameter.value_type) for parameter in parameters]
-            )
+            fn = generator.symbol_table.get(function_name, None)
             
-            generator.llvmir.function = ir.Function(generator.llvmir.module, fn_llvmlite_type, name=function_name)
+            # Collect parameters, note they could be empty
+            parameters = []
+            if (gen_node[2] != ")"):
+                parameters = gen_node[2]
+            if (fn is None):            
+                fn = create_function(function_name, function_type, parameters)
+            
+                generator.symbol_table[function_name] = fn 
+
+            else:
+                # XXX Do some checking if the function already exists (should be a
+                #     forward declaration)
+                # Override the existing parameters since the come from a forward
+                # declaration and they may not have names
+                fn.parameters = parameters
+
+            # Link the parameters to the ir builder function arguments and put
+            # them in the overflow symbol table
+            for parameter, arg in zip(fn.parameters, fn.ir.args):
+                parameter.ir_reg = arg
+                generator.symbol_table.set_overflow_item(parameter.name, parameter)
+
+            generator.llvmir.function = fn.ir
 
             # Give a hard-coded name that gets removed below since clang-generated
             # tests don't contain a basic block entry label
             block = generator.llvmir.function.append_basic_block("entry")
             generator.llvmir.builder = ir.IRBuilder(block)
 
-            # Link the parameters to the ir builder function arguments
-            for parameter, arg in zip(parameters, generator.llvmir.function.args):
-                parameter.ir_reg = arg
-
             # Generate the function's body
             gen_node = generate_ir(generator, node.children[-1])
 
-            if (gen_node == "}"):
-                # Empty function, put a return void so LLVM doesn't error out on
-                # an empty block
+            # The current block won't be terminated either because 
+            # - it's the unreacheable block placed after every return
+            # -  the main function returns void 
+            # - doesn't have returns in the main path (eg returns on the if
+            #   branches but not on the endif)
+            # Always return an Undefined value of the right type to prevent
+            # LLVM IR errors about the block not being terminated, which happens
+            # even if the block is unreacheable
+            assert (not generator.llvmir.builder.block.is_terminated)
+            if (fn.value_type == "void"):
                 generator.llvmir.builder.ret_void()
+            else:
+                generator.llvmir.builder.ret(get_llvmlite_type(fn.value_type)(ir.Undefined))
             
             fn.llvm_irs = str(generator.llvmir.function).splitlines()
             do_reindexing = False
@@ -1247,14 +1415,20 @@ def generate_ir(generator, node):
             for child in node.children:
                 gen_node.append(generate_ir(generator, child))
 
-            parameter_type, parameter_name = gen_node
+            parameter_name = None
+            parameter_type = gen_node[0]
+            if (len(gen_node) > 1):
+                parameter_name = gen_node[1].value
+            
+            # Don't put the parameters in the symbol table yet, since this could
+            # be a forward declaration that should not put them because we don't
+            # want to modify the overflow with forward declarations, and we may
+            # note even get parameter with names here
             parameter = Struct(
-                type="variable", 
-                name=parameter_name.value, 
+                type="parameter", 
+                name=parameter_name, 
                 value_type=parameter_type, 
             )
-            
-            generator.symbol_table.set_overflow_item(parameter_name.value, parameter)
             
             gen_node = parameter
                             
@@ -1263,7 +1437,8 @@ def generate_ir(generator, node):
             # declarator contains one identifier and one or none initializers
             # init_declarator:  declarator
             # |  declarator "=" initializer
-            identifier = get_tree_tokens(node.children[0])[0]
+            identifier = generate_ir(generator, node.children[0])
+            #identifier = get_tree_tokens(node.children[0])[0]
             initializer = None
             if (len(node.children) > 1):
                 initializer = generate_ir(generator, node.children[2])
@@ -1271,39 +1446,65 @@ def generate_ir(generator, node):
             gen_node = [identifier, initializer]
 
         elif (node.data == "declaration"):
-            # declaration contains one type and one or more identifiers and or
-            # initializerss
             # declaration:  declaration_specifiers init_declarator_list? ";"
 
-            # XXX Right now all variables are allocated on the stack, globals
-            #     not supported
-            assert (len(generator.symbol_table) > 1), "Global variables not supported yet!"
-            
-            # The declarator list may contain initializer so it needs
-            # generating
-            if (len(node.children) > 1):
-                gen_node = generate_ir(generator, node.children[1])
-                
-            # Register the variable and create an IR node to hold the
-            # initializer, if any
-            decl_type = get_tree_tokens(node.children[0])[0]
-            for identifier, initializer in gen_node:
-                variable = Struct(
-                    type="variable", 
-                    name=identifier, 
-                    value_type=decl_type,
-                    # Value_reg and value_ref will be assigned on usage
-                )
-                generator.symbol_table[identifier] = variable
-                
-                if (initializer is not None):
-                    # XXX This should come from gen_node instead of having
-                    #     to recreate it here?
-                    a = Struct(type="identifier", value=identifier)
-                    b = initializer
+            # declaration contains one type and one or more identifiers and or
+            # initializerss
 
-                    generate_assign_ir(generator, a, b)
+            if (len(generator.symbol_table) == 1):
+                # Global scope declaration
+                
+                # XXX Only forward function declarations are supported, global
+                #     variables are not
+                assert (
+                    (len(node.children) > 1) and 
+                    (get_grandson(node, [1, 0, 0, 0, 1]).value == "(")
+                ), "Only function forward declarations supported!!!"
+                
+                function_type = generate_ir(generator, node.children[0])
+                # Gather the function parameters
+                # XXX This has some unnecessary nesting, find the culprit and
+                #     flatten it?
+                gen_node = generate_ir(generator, node.children[1])
+                function_name = gen_node[0][0][0].value
+                # LLVM only allows declaring functions once, ignore if already
+                # declared
+                # XXX Should this check it matches the existing declaration?
+                if (function_name not in generator.symbol_table):
+                    parameters = []
+                    if (gen_node[0][0][2] != ")"):
+                        parameters = gen_node[0][0][2]
+                    fn = create_function(function_name, function_type, parameters)
+                    generator.symbol_table[function_name] = fn
+
+            else:
+                # Local scope variable, stored in the stack
+                
+                # The declarator list may contain initializer so it needs
+                # generating
+                if (len(node.children) > 1):
+                    gen_node = generate_ir(generator, node.children[1])
                     
+                # Register the variable and create an IR node to hold the
+                # initializer, if any
+                decl_type = generate_ir(generator, node.children[0])
+                for identifier, initializer in gen_node:
+                    variable = Struct(
+                        type="variable", 
+                        name=identifier.value, 
+                        value_type=decl_type,
+                        # Value_reg and value_ref will be assigned on usage
+                    )
+                    generator.symbol_table[identifier.value] = variable
+                    
+                    if (initializer is not None):
+                        # XXX This should come from gen_node instead of having
+                        #     to recreate it here?
+                        a = Struct(type="identifier", value=identifier.value)
+                        b = initializer
+
+                        generate_assign_ir(generator, a, b)
+                        
             gen_node = Struct(type="ir", value_type="void", ir_reg=None)
             
 
@@ -1391,7 +1592,7 @@ def generate_ir(generator, node):
                 generator.llvmir.continue_bb = loop_cond_bb
 
                 # Jump to the condition
-                generator.llvmir.builder.branch(loop_cond_bb)
+                generate_branch_ir(loop_cond_bb)
                 
                 # Generate loop condition
                 generator.llvmir.builder.position_at_start(loop_cond_bb)
@@ -1404,12 +1605,12 @@ def generate_ir(generator, node):
                         get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_ir_reg])
 
                 # Jump to exit or to start of loop
-                generator.llvmir.builder.cbranch(a_ir_reg, loop_body_bb, loop_end_bb)
+                generate_cbranch_ir(a_ir_reg, loop_body_bb, loop_end_bb)
 
                 # Generate loop body
                 generator.llvmir.builder.position_at_start(loop_body_bb)
                 generate_ir(generator, node.children[4])
-                generator.llvmir.builder.branch(loop_cond_bb)
+                generate_branch_ir(loop_cond_bb)
 
                 # Restore old break/continue
                 generator.llvmir.break_bb = prev_break_bb
@@ -1433,12 +1634,12 @@ def generate_ir(generator, node):
                 generator.llvmir.continue_bb = loop_cond_bb
 
                 # Jump to the loop body
-                generator.llvmir.builder.branch(loop_body_bb)
+                generate_branch_ir(loop_body_bb)
 
                 # Generate loop body
                 generator.llvmir.builder.position_at_start(loop_body_bb)
                 generate_ir(generator, node.children[1])
-                generator.llvmir.builder.branch(loop_cond_bb)
+                generate_branch_ir(loop_cond_bb)
 
                 # Generate loop condition
                 generator.llvmir.builder.position_at_start(loop_cond_bb)
@@ -1451,7 +1652,7 @@ def generate_ir(generator, node):
                         get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_ir_reg])
 
                 # Jump to exit or to start of loop
-                generator.llvmir.builder.cbranch(a_ir_reg, loop_body_bb, loop_end_bb)
+                generate_cbranch_ir(a_ir_reg, loop_body_bb, loop_end_bb)
 
                 # Restore old break/continue
                 generator.llvmir.break_bb = prev_break_bb
@@ -1500,7 +1701,7 @@ def generate_ir(generator, node):
                 generator.llvmir.break_bb = loop_end_bb
                 generator.llvmir.continue_bb = loop_incr_bb
 
-                generator.llvmir.builder.branch(loop_cond_bb)
+                generate_branch_ir(loop_cond_bb)
                 
                 generator.llvmir.builder.position_at_start(loop_cond_bb)
                 if (node.children[next_child] != ";"):
@@ -1516,11 +1717,11 @@ def generate_ir(generator, node):
                             get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_ir_reg])
 
                     # Jump to exit or to start of loop
-                    generator.llvmir.builder.cbranch(a_ir_reg, loop_body_bb, loop_end_bb)
+                    generate_cbranch_ir(a_ir_reg, loop_body_bb, loop_end_bb)
                     next_child += 1
 
                 else:
-                    generator.llvmir.builder.branch(loop_body_bb)
+                    generate_branch_ir(loop_body_bb)
                 
                 # Skip over ;
                 next_child += 1
@@ -1531,14 +1732,14 @@ def generate_ir(generator, node):
                     gen_node = generate_ir(generator, node.children[next_child])
 
                     next_child += 1
-                generator.llvmir.builder.branch(loop_cond_bb)
+                generate_branch_ir(loop_cond_bb)
 
                 next_child += 1
 
                 # Generate the for body 
                 generator.llvmir.builder.position_at_start(loop_body_bb)
                 generate_ir(generator, node.children[next_child])
-                generator.llvmir.builder.branch(loop_incr_bb)
+                generate_branch_ir(loop_incr_bb)
                 
                 # Generate the end
                 generator.llvmir.builder.position_at_start(loop_end_bb)
@@ -1562,7 +1763,7 @@ def generate_ir(generator, node):
             if (node.children[0] == "if"):
                 # Generate the condition expression
                 gen_node = generate_ir(generator, node.children[2])
-
+                
                 a_ir_reg, a_type = get_ir_reg_and_type(gen_node)
                 
                 # Convert expression to _Bool
@@ -1570,18 +1771,26 @@ def generate_ir(generator, node):
                 if (a_type != res_type):
                     a_ir_reg = generate_extern_call_ir(generator, 
                         get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_ir_reg])
+                
+                builder = generator.llvmir.builder
+                if_then_bb = builder.function.append_basic_block("ifthen")
+                if_else_bb = builder.function.append_basic_block("ifelse")
+                if_end_bb = builder.function.append_basic_block("ifend")
+                
+                generate_cbranch_ir(a_ir_reg, if_then_bb, if_else_bb)
 
-                if (len(node.children) == 5):
-                    with generator.llvmir.builder.if_then(a_ir_reg):
-                        generate_ir(generator, node.children[4])
+                # Generate then
+                generator.llvmir.builder.position_at_start(if_then_bb)
+                generate_ir(generator, node.children[4])
+                generate_branch_ir(if_end_bb)
+                
+                generator.llvmir.builder.position_at_start(if_else_bb)
+                if (len(node.children) > 5):
+                    # Generate else
+                    generate_ir(generator, node.children[6])
+                generate_branch_ir(if_end_bb)
 
-                else:
-                    with generator.llvmir.builder.if_else(a_ir_reg) as (then, otherwise):
-                        with then:
-                            generate_ir(generator, node.children[4])
-
-                        with otherwise:
-                            generate_ir(generator, node.children[6])
+                generator.llvmir.builder.position_at_start(if_end_bb)                    
 
                 # XXX Missing gen node
             else:
@@ -1695,8 +1904,15 @@ def llvm_compile(llvm_ir, function_signatures):
 
         pmb = llvm.create_pass_manager_builder()
         pmb.opt_level = opt
+        # XXX Investigate enabling these. At least not disabling loop-vectorize
+        #     in clang command line is known to produce different code for the
+        #     ffact functions.c test
         pmb.loop_vectorize = loop_vectorize
         pmb.slp_vectorize = slp_vectorize
+        # XXX An inlining threshold of 20 is enough to inline the utility
+        #     functions and generates closer code to clang -O2 in one single
+        #     case fsum_indirect2, since otherwise epycc does one final call
+        #     recursion elimintion that clang doesn't do
         pmb.inlining_threshold = _inlining_threshold(opt)
 
         return pmb
@@ -1724,8 +1940,13 @@ def llvm_compile(llvm_ir, function_signatures):
     jit_lib.asm = target_machine.emit_assembly(mod)
     jit_lib.ir = str(mod)
 
-    output_dot = True
-    output_optimized_dot = True
+    # Dot generation is known to take half the test running time under
+    # runsnakerun, disable it unless debug 
+    # XXX Get these from configs and/or expose a generate_dot
+    # function
+    debug = (__name__ == "__main__")
+    output_dot = debug
+    output_optimized_dot = debug
     if (output_dot):
         for function_signature in function_signatures:
             func = mod.get_function(function_signature.name)
@@ -2035,12 +2256,15 @@ def llvm_ir_diff(filepath_a, filepath_b, function_names = None):
                     lacks_remappings1 = any([token not in remapping_table for token in tokens1])
 
                 if (lacks_remappings0 and lacks_remappings1):
+                    # When both have remappings missing, sort by original order
                     res = cmp(i0_i, i1_i)
                 
                 elif (lacks_remappings0):
+                    # Instruction missing remappings to the end
                     res = 1
                 
                 elif (lacks_remappings1):
+                    # Instruction missing remappings to the end
                     res = -1
 
                 else:
@@ -2062,6 +2286,7 @@ def llvm_ir_diff(filepath_a, filepath_b, function_names = None):
                 res = -1
 
             else:
+                # sort by original position
                 res = cmp(i0_i, i1_i)             
 
             return res
@@ -2097,15 +2322,16 @@ def llvm_ir_diff(filepath_a, filepath_b, function_names = None):
         if ((function_names is not None) and (fn_a.name not in function_names)):
             continue
 
-        # look for the function in b, note this won't return as diffs the
-        # functions in b not present in a
+        # look for the function in b, note it's intentional this will ignore
+        # and not return as diffs the functions in b not present in a
         for fn_b in mod_b.functions:
             if (fn_a.name == fn_b.name):
                 break
         else:
             # fn_a doesn't exist in b, add each instruction to the mismatch
             # XXX Note this will contain comments and the function header, which
-            #     will be different from when the function is found?
+            #     won't appear on a regular per block diff where both a and
+            #     bhave the function
             mismatches[fn_a.name] = [instr for instr in str(fn_a).splitlines()]
             continue
             
@@ -2151,6 +2377,11 @@ def llvm_ir_diff(filepath_a, filepath_b, function_names = None):
             instructions_sorted_a = sort_instructions(instructions_a)
             instructions_sorted_b = sort_instructions(instructions_b, remapping_table)
 
+            debug_instruction_sorting = False
+            if (debug_instruction_sorting):
+                print "a sorted\n", string.join([str(instr) for instr in instructions_sorted_a], "\n")
+                print "b sorted\n", string.join([str(instr) for instr in instructions_sorted_b], "\n")
+
             needs_revisiting = False
             # Fill with empty strings so they are detected as mismatches
             # Note this works because it gets handled as different token lengths
@@ -2160,8 +2391,10 @@ def llvm_ir_diff(filepath_a, filepath_b, function_names = None):
             for instr_a, instr_b in zip(instructions_sorted_a, instructions_sorted_b):
                 str_instr_a = str(instr_a).strip()
                 str_instr_b = str(instr_b).strip()
-                tokens_a = re.split(r"[ ,]+", str_instr_a)
-                tokens_b = re.split(r"[ ,]+", str_instr_b)
+                # Note some operations (eg switch) include carriage returns,
+                # remove those too
+                tokens_a = re.split(r"[ ,\n]+", str_instr_a)
+                tokens_b = re.split(r"[ ,\n]+", str_instr_b)
 
                 if ((len(tokens_a) != len(tokens_b)) or 
                     (instr_a.opcode != instr_b.opcode) or 
@@ -2255,10 +2488,13 @@ def llvm_ir_diff(filepath_a, filepath_b, function_names = None):
 
 
 if (__name__ == "__main__"):
+
+    # print llvm_ir_diff("_out/gold_function.c.optimized.ll", "_out/function.c.optimized.ll", "ffib")
+
     source = open("samples/current.c").read()
     lib = epycc_compile(source, True)
     print lib.ir
     print lib.ir_optimized
     #print lib.asm
     #print lib.asm_optimized
-    print lib.ffor_nested(10, 20)
+    print lib.fsum_indirect1(10)

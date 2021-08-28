@@ -216,6 +216,79 @@ epycc
     }
 
 
+llvmlite IR builder value naming
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+llmvlite IR generates names differently from the default LLVM IR value naming 
+(registers and labels) that clang uses.
+
+
+Different phi instruction ordering
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ 
+
+Phi instructions can be ordered differently, and their parameters too
+
+clang
+
+    ; <label>:4:                                      ; preds = %27, %2
+    %5 = phi i32 [ %34, %27 ], [ -4, %2 ]
+    %6 = phi i32 [ %33, %27 ], [ -1, %2 ]
+    %7 = phi i32 [ %32, %27 ], [ 0, %2 ]
+    %8 = phi i32 [ %30, %27 ], [ 0, %2 ]
+    %9 = phi i32 [ %29, %27 ], [ 0, %2 ]
+    %10 = lshr i32 %6, 3
+    %11 = icmp eq i32 %8, 0
+    br i1 %11, label %27, label %12
+
+epycc
+
+    forcond.1.preheader:                              ; preds = %forend.1, %entry
+    %indvars.iv10 = phi i32 [ %indvars.iv.next11, %forend.1 ], [ -4, %entry ]
+    %indvars.iv8 = phi i32 [ %indvars.iv.next9, %forend.1 ], [ -1, %entry ]
+    %indvars.iv = phi i32 [ %indvars.iv.next, %forend.1 ], [ 0, %entry ]
+    %.4.05 = phi i32 [ %13, %forend.1 ], [ 0, %entry ]
+    %.7.03 = phi i32 [ %14, %forend.1 ], [ 0, %entry ]
+    %1 = lshr i32 %indvars.iv8, 3
+    %2 = icmp eq i32 %.7.03, 0
+    br i1 %2, label %forend.1, label %forbody.1.preheader
+
+those two snippets are equivalent but the phi instructions are sorted
+differently because they are independent, specifically 
+
+    %8 = phi i32 [ %30, %27 ], [ 0, %2 ]
+    %9 = phi i32 [ %29, %27 ], [ 0, %2 ]
+
+and %.4.05 = phi i32 [ %13, %forend.1 ], [ 0, %entry ] %.7.03 = phi i32 [ %14,
+    %forend.1 ], [ 0, %entry ]
+
+You can fix some of those by rearranging when basic blocks are added to the
+function
+
+
+Other instruction reordering
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+clang
+
+    define dso_local i32 @fif_chainedreturn(i32, i32) local_unnamed_addr #0 {
+        %3 = icmp eq i32 %0, 2
+        %4 = select i1 %3, i32 5, i32 6
+        %5 = icmp eq i32 %0, 1
+        %6 = select i1 %5, i32 0, i32 %4
+        ret i32 %6
+    }
+
+epycc
+
+    define i32 @fif_chainedreturn(i32 %.1, i32 %.2) local_unnamed_addr #0 {
+        entry:
+        %0 = icmp eq i32 %.1, 1
+        %1 = icmp eq i32 %.1, 2
+        %. = select i1 %1, i32 5, i32 6
+        %merge = select i1 %0, i32 0, i32 %.
+        ret i32 %merge
+    }
+
 """
 import os
 import re
@@ -234,7 +307,7 @@ def test_single_cfile(test_filepath, ignore_existing_files=False):
     print "testing", os.path.split(test_filepath)[1]
 
     sys.stdout.flush()
-
+    
     out_dir = os.path.join(epycc_dirpath, "_out")
     gold_dir = os.path.join(epycc_dirpath, "_out")
 
@@ -248,13 +321,19 @@ def test_single_cfile(test_filepath, ignore_existing_files=False):
 
     #  If the gold IR file already exists, no need to generate it from clang
     if (ignore_existing_files or (not os.path.exists(gold_optimized_ir_filepath)) or 
-        (os.path.getmtime(test_filepath) >= os.path.getmtime(gold_optimized_ir_filepath))):
+        (os.path.getmtime(test_filepath) >= os.path.getmtime(gold_optimized_ir_filepath)) or
+        (os.path.getmtime(__file__) >= os.path.getmtime(gold_optimized_ir_filepath))
+        ):
         # Golden file can be obtained by:
         # - compiling with clang
         # - running epycc before the change and copying from out to golden (this assumes
         #   a fresh repo passes the tests)
         epycc.invoke_clang(test_filepath, gold_ir_filepath)
-        epycc.invoke_clang(test_filepath, gold_optimized_ir_filepath, "-O2")
+        # XXX Disable loop unrolling and vectorization to match what epycc produces
+        #     and make comparing results easier. This should be enabled on epycc and
+        #     re-enabled here. See the test function ffact where both affect the 
+        #     generated code
+        epycc.invoke_clang(test_filepath, gold_optimized_ir_filepath, "-O2 -fno-unroll-loops -fno-vectorize")
     
 
     # Compile with epycc
@@ -297,7 +376,7 @@ def test_single_cfile(test_filepath, ignore_existing_files=False):
     functions_mismatches = epycc.llvm_ir_diff(gold_optimized_ir_filepath, test_optimized_ir_filepath)
         
     for fn_name in gold_ir:
-        
+
         try:
             test_count += 1
             mismatches = functions_mismatches[fn_name]
@@ -336,6 +415,12 @@ def test_single_cfile(test_filepath, ignore_existing_files=False):
 
 if (__name__ == "__main__"):
     ignore_existing_files = False
+
+    # Make exception stack tracing go to stdout same as regular printing 
+    # so both outputs are synchronized
+    # XXX Optionally everything could go to err, to a log file (better), or put
+    #     the exception information on stdout
+    sys.stderr = sys.stdout
 
     cfiles_dirpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cfiles")
     for (dirpath, dirnames, filenames) in os.walk(cfiles_dirpath):

@@ -170,18 +170,19 @@ Since the module includes a full featured C parser, it can also be used to parse
 ## Current functionality
 - [x] Parse most of C99 code
 - [x] Generate IR for floating point and integer expressions
-- [x] Generate IR for functions
+- [x] Generate IR for function definitions
 - [x] Generate IR for assigning / reading to / from function parameters and local scalar variables
 - [x] Generate IR for if then / else statements
 - [x] Generate IR for for/while continue/break statements
+- [x] Generate IR for internal function calls, forward function declarations, direct and indirect recursive functions
 - [x] Execute generated IR seamlessly like a Python function
 - [x] "ctypable" transparent Python parameter passing support
 
 ## Future functionality
-- [ ] Generate IR for function calls
 - [ ] Generate IR for switch statements
 - [ ] Generate IR for arrays, pointers
 - [ ] Generate IR for structs, user defined types, bitfields
+- [ ] Generate IR for vararg functions
 - [ ] Parse all C99 code (lexer hack, octal, hex, etc)
 - [ ] Assembler support
 - [ ] Packaging into a proper Python package
