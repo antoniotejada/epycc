@@ -1542,7 +1542,7 @@ def generate_ir(generator, node):
             
             gen_node = Struct(type="constant", value_type=value_type, value=value)
 
-        elif (node.data == "floating_constant"):
+        elif (node.data == "float_constant"):
             float_type = "double"
             value = node.children[0].value
             if (value[-1] in ["f", "F"]):
@@ -2028,21 +2028,33 @@ def epycc_generate(source, debug = False):
     # the terminals that may hit that problem, and the grammar doesn't seem to need
     # the dynamic lexer anyway
 
-    # XXX Earley properly auto resolves ambiguity between identifier and
-    #    typedef_name that the LALR(1) chokes on, but it doesn't detect the "T* t;"
-    #    ambiguity (this can be seen when opened with ambiguity="explicit", there
-    #    are no trees due to T* t; under _ambig node), so still requires some 
-    #    lexer hack or such
-
-    # XXX Earley is really slow (~13 lines per second) and causes stack overflow
-    #     with long C files (thousands of lines). Massage the grammar to be
-    #     LALR(1) and switch to LALR parser. Optionally once epycc can
-    #     bootstrap itself and write the parser code code in C (the AST
-    #     traversal can remain in Python).
     grammar_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
         "grammars", "c99_phrase_structure_grammar.lark")
-    parser = lark.Lark.open(grammar_filepath, keep_all_tokens="True", 
-        lexer="standard")
+    use_earley = False
+    if (use_earley):
+        # Earley properly auto resolves ambiguity between identifier and
+        # typedef_name that the LALR(1) chokes on, but it doesn't detect the "T*
+        # t;" ambiguity (this can be seen when opened with ambiguity="explicit",
+        # there are no trees due to T* t; under _ambig node), so still requires
+        # some lexer hack or such
+        
+        # Note that Earley is 10x slower than LALR with file caching, and causes
+        # stack overflow with long C files (thousands of lines).
+        parser = lark.Lark.open(grammar_filepath, keep_all_tokens="True", 
+            lexer="standard")
+            
+    else:
+        # XXX Optionally once epycc can bootstrap itself, write the parser code
+        #     in C or use some bison/flex to generate the AST (the AST traversal
+        #     can remain in Python).
+        # Workaround https://github.com/lark-parser/lark/issues/977 (unbound
+        # method exists()) to enable caching
+        setattr(lark.utils.FS, 'exists', staticmethod(os.path.exists))
+        # Load LALR and enable caching (LALR 7x faster than Earley, 10x with
+        # file cache)
+        parser = lark.Lark.open(grammar_filepath, keep_all_tokens="True", 
+            lexer="standard", parser="lalr", cache=True)
+
     tree = parser.parse(source)
 
     if (debug):
@@ -2287,7 +2299,7 @@ def llvm_ir_diff(filepath_a, filepath_b, function_names = None):
 
             else:
                 # sort by original position
-                res = cmp(i0_i, i1_i)             
+                res = cmp(i0_i, i1_i)
 
             return res
 
