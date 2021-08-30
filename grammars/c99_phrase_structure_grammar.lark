@@ -276,46 +276,35 @@ expression:  assignment_expression
 external_declaration:  function_definition
   |  declaration
 
+
+
 // Start
-start: translation_unit
+start:  translation_unit
+
+
 
 // Lexer terminals
 
-identifier: IDENTIFIER
-
-string_literal: ESCAPED_STRING
+identifier:  IDENTIFIER
 
 // Note enumeration_constant present in the spec has been removed from constant
 // so it doesn't cause reduction-reduction conflicts in primary_expression 
 // (hook on primary_expression's identifier to get an enumeration_constant)
-constant: integer_constant
-  |  float_constant
-  |  character_constant
+constant:  integer_constant
+    |  floating_constant
+    |  character_constant
+  
+integer_constant:  DECIMAL_CONSTANT
+    |  HEXADECIMAL_CONSTANT
+    |  OCTAL_CONSTANT
 
-integer_constant: INT_SUFFIXED
+floating_constant: DECIMAL_FLOATING_CONSTANT
+    |  HEXADECIMAL_FLOATING_CONSTANT
 
-float_constant: FLOAT_SUFFIXED
+enumeration_constant:  identifier
 
-enumeration_constant: identifier
-
-character_constant: "'" c_char_sequence "'"
-  | "L'" c_char_sequence "'"
-
-c_char_sequence: c_char
-  | c_char_sequence c_char
-
-c_char: c_char_set
-  | escape_sequence
-
-c_char_set: /[^\n\\']/
-
-escape_sequence: simple_escape_sequence
-  // XXX Needs adding all the escape cases, encodings, etc
-  // octal-escape-sequence
-  // hexadecimal-escape-sequence
-  // universal-character-name
-
-simple_escape_sequence: "\\'" | "\\\"" | "\\?" | "\\" | "\\a" | "\\b" | "\\f" | "\\n" | "\\r" | "\\t" | "\\v"
+character_constant:   CHARACTER_CONSTANT
+string_literal:  STRING_LITERAL
 
 // XXX Missing ignoring slash newline, can't be done with
 //     %ignore /\\\n/
@@ -325,26 +314,41 @@ simple_escape_sequence: "\\'" | "\\\"" | "\\?" | "\\" | "\\a" | "\\b" | "\\f" | 
 %ignore C_COMMENT
 %ignore CPP_COMMENT
 
-FLOAT_SUFFIXED: FLOAT ("f" | "F" | "L" | "l")?
-// XXX Note this regexp fails to parse appropriately numbers with two suffixes
-//     due to Python's regex not picking the longest option across alternatives,
-//     see issues in constants.c
-INT_SUFFIXED: INT (INT_SIZE_SUFFIX INT_TYPE_SUFFIX? | INT_TYPE_SUFFIX INT_SIZE_SUFFIX?)?
-INT_SIZE_SUFFIX: "l" | "L" | "ll" | "LL"
-INT_TYPE_SUFFIX: "u" | "U"
+// Adapted from http://www.quut.com/c/ANSI-C-grammar-l-1999.html
 
-IDENTIFIER: CNAME
+// Make sure regexps in an alternative clause appear in length order so the
+// longest match is returned first, otherwise integers like 1ULL may be scanned
+// as 1UL plus the identifier L see https://github.com/lark-parser/lark/pull/980
+D: /[0-9]/
+L: /[a-zA-Z_]/
+H: /[a-fA-F0-9]/
+E: (/[Ee][+-]?/D+)
+P: (/[Pp][+-]?/D+)
+FS: ("f"|"F"|"l"|"L")
+ISS: ("ll"|"LL"|"l"|"L")
+ITS: ("u"|"U")
+IS: (ISS ITS? | ITS ISS?)?
+
+IDENTIFIER: L (L|D)*
+
+HEXADECIMAL_CONSTANT: /0[xX]/H+IS?
+OCTAL_CONSTANT: /0[0-7]*/IS?
+DECIMAL_CONSTANT: /[1-9]/D*IS?
+CHARACTER_CONSTANT: /L?'(.|[^'\n])+'/
+STRING_LITERAL: /L?"(.|[^"\n])*"/
+
+DECIMAL_FLOATING_CONSTANT: D+ E FS? | D*"."D+E?FS? | D+"."D*E?FS?
+HEXADECIMAL_FLOATING_CONSTANT: /0[xX]/H+P FS? | /0[xX]/H*"."H+P FS? | /0[xX]/H+"."H*P FS?
+
 
 // These are defined in common.lark
-%import common.ESCAPED_STRING
-%import common.FLOAT
-%import common.INT
 %import common.WS
-%import common.CNAME
 %import common.C_COMMENT
 %import common.CPP_COMMENT
 
 // XXX Missing lexer hack to tell between "T* t;" declaration and "t * t;" expression
-// XXX This will need handling in the lexer using semantic information from the
+//     This will need handling in the lexer using semantic information from the
 //     symbol table to tell the difference between a type and an identifier
+//     See https://gist.github.com/MegaIng/a3e6e3debdfd85481e3872fb6261bae0 for a 
+//     possible implementation
 %declare TYPEDEF_NAME

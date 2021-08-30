@@ -1538,11 +1538,11 @@ def generate_ir(generator, node):
             if ("U" in suffix):
                 value_type = "unsigned " + value_type
                 value_len -= 1
-            value = int(value[:value_len])
+            value = int(value[:value_len], 0)
             
             gen_node = Struct(type="constant", value_type=value_type, value=value)
 
-        elif (node.data == "float_constant"):
+        elif (node.data == "floating_constant"):
             float_type = "double"
             value = node.children[0].value
             if (value[-1] in ["f", "F"]):
@@ -1551,9 +1551,23 @@ def generate_ir(generator, node):
             if (value[-1] in ["f", "F", "L", "l"]):
                 value = value[:-1]
 
-            value = float(value)
+            if (value.startswith("0x")):
+                value = float.fromhex(value)
+
+            else:
+                value = float(value)
 
             gen_node = Struct(type="constant", value_type = float_type, value= value)
+
+        elif ((node.data == "character_constant") or (node.data == "string_literal")):
+            # XXX Needs handling of the escape cases, encodings, etc
+            #     octal-escape-sequence
+            #     hexadecimal-escape-sequence
+            #     universal-character-name
+            # simple_escape_sequence: "\\'" | "\\\"" | "\\?" | "\\" | "\\a" | "\\b" | "\\f" | "\\n" | "\\r" | "\\t" | "\\v"
+
+            assert False, "character_constant / string_literal not supported yet!"
+
 
         elif (node.data == "identifier"):
             gen_node = Struct(type="identifier", value=node.children[0].value)
@@ -2016,33 +2030,34 @@ def epycc_generate(source, debug = False):
     # XXX check if we can tag which tokens to keep with "!" in the rule instead 
     #     of keep_all_tokens
 
-    # Use the standard lexer since the earley parser dynamic lexer confuses return
-    # token with an identifier when a parenthesis follows, eg
-    #   float fdouble(float a) {
-    #     return (a * 2.0 + 3.0) * 6.0 ;
-    #   }
-    # Another way of fixing it is by adding a blacklist of keywords to the identifier
-    # terminal:
-    #   IDENTIFIER: /(?!(break|return)\b)/CNAME
-    # but the negative lookahead is probably less efficient, cumbersome to add all
-    # the terminals that may hit that problem, and the grammar doesn't seem to need
-    # the dynamic lexer anyway
-
     grammar_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
         "grammars", "c99_phrase_structure_grammar.lark")
     use_earley = False
     if (use_earley):
+        # Use the standard lexer since the earley parser dynamic lexer confuses return
+        # token with an identifier when a parenthesis follows, eg
+        #   float fdouble(float a) {
+        #     return (a * 2.0 + 3.0) * 6.0 ;
+        #   }
+        # Another way of fixing it is by adding a blacklist of keywords to the identifier
+        # terminal:
+        #   IDENTIFIER: /(?!(break|return)\b)/CNAME
+        # but the negative lookahead is probably less efficient, cumbersome to add all
+        # the terminals that may hit that problem, and the grammar doesn't seem to need
+        # the dynamic lexer anyway
+
         # Earley properly auto resolves ambiguity between identifier and
         # typedef_name that the LALR(1) chokes on, but it doesn't detect the "T*
         # t;" ambiguity (this can be seen when opened with ambiguity="explicit",
         # there are no trees due to T* t; under _ambig node), so still requires
-        # some lexer hack or such
+        # some lexer hack or such (although on a recent test Earley did properly
+        # detect both ambiguous trees, see https://github.com/lark-parser/lark/issues/977#issuecomment-907900877
         
         # Note that Earley is 10x slower than LALR with file caching, and causes
         # stack overflow with long C files (thousands of lines).
         parser = lark.Lark.open(grammar_filepath, keep_all_tokens="True", 
             lexer="standard")
-            
+
     else:
         # XXX Optionally once epycc can bootstrap itself, write the parser code
         #     in C or use some bison/flex to generate the AST (the AST traversal
@@ -2052,6 +2067,9 @@ def epycc_generate(source, debug = False):
         setattr(lark.utils.FS, 'exists', staticmethod(os.path.exists))
         # Load LALR and enable caching (LALR 7x faster than Earley, 10x with
         # file cache)
+        # Note LALR works with both the standard and context lexers, but is not
+        # able to solve the C99 typedef_name / identifier ambiguity, it just picks
+        # identifier over typedef_name
         parser = lark.Lark.open(grammar_filepath, keep_all_tokens="True", 
             lexer="standard", parser="lalr", cache=True)
 
@@ -2500,7 +2518,6 @@ def llvm_ir_diff(filepath_a, filepath_b, function_names = None):
 
 
 if (__name__ == "__main__"):
-
     # print llvm_ir_diff("_out/gold_function.c.optimized.ll", "_out/function.c.optimized.ll", "ffib")
 
     source = open("samples/current.c").read()
