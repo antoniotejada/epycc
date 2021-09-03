@@ -168,23 +168,30 @@ mul__int__int__int:
 Since the module includes a full featured C parser, it can also be used to parse and inspect C code.
 
 ## Current functionality
-- [x] Parse most of C99 code
+- [x] Parse all C99 code (only missing C lexer hack)
 - [x] Generate IR for floating point and integer expressions
 - [x] Generate IR for function definitions
 - [x] Generate IR for assigning / reading to / from function parameters and local scalar variables
 - [x] Generate IR for if then / else statements
 - [x] Generate IR for for/while continue/break statements
 - [x] Generate IR for internal function calls, forward function declarations, direct and indirect recursive functions
+- [x] Generate IR for arrays (runtime and compile time sized)
 - [x] Execute generated IR seamlessly like a Python function
-- [x] "ctypable" transparent Python parameter passing support
+- [x] "ctypable" transparent Python parameter passing support, including converting Python lists to C arrays under the hood
+
+Check the [tests directory](tests/cfiles) for examples of the currently supported constructs.
+
 
 ## Future functionality
 - [ ] Generate IR for switch statements
-- [ ] Generate IR for arrays, pointers
+- [ ] Generate IR for pointers, addressof operator
 - [ ] Generate IR for structs, user defined types, bitfields
 - [ ] Generate IR for vararg functions
-- [ ] Parse all C99 code (lexer hack, octal, hex, etc)
+- [ ] Generate IR for global variables/constants
+- [ ] Generate IR for global constructors (via llvm.global_ctors or manually)
+- [ ] Parse lexer hack
 - [ ] Assembler support
+- [ ] Widely used compiler-specific pragma/attributes/declspec (thread, packed, aligned...). See https://clang.llvm.org/docs/AttributeReference.html
 - [ ] Packaging into a proper Python package
 - [ ] Publishing to Pypi
 - [ ] External native function calling from inside C

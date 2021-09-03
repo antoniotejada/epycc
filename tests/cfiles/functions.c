@@ -69,25 +69,30 @@ int fsum(int a) {
 
 
 // Indirect recursive functions
-// XXX These have 5 mismatches, looks like epycc is doing last call optimization
+// XXX These have mismatches, looks like epycc is doing last call optimization
 //     while clang isn't? Should look further into it, clang seems to have the
 //     inline threshold around 25 for -O2 (with "-mllvm --inline-threshold=21"
 //     produces the same code as without, and different code than with 20)
+//     They used to be 5 mismatches, but the new IR diff code increfased the 
+//     number of mismatches because of also counting the missing instructions.
 // XXX In addition, clang inserts a phi node to unify return paths while epycc
 //     doesn't (and is one jump shorter because of that)
-int fsum_indirect2__mm5(int a);
-int fsum_indirect1__mm5(int a) {
+// XXX Note these two may generate different code depending on the function
+//     names and cause the mismatch to toggle between 7 and 20. Maybe there's
+//     some leftover in epycc, llvmlite, the flags or llvm is not idempotent?
+int fsum_indirect2__mm07(int a);
+int fsum_indirect1__mm06(int a) {
     if (a == 0) {
         return 0;
     }
-    return (a * 2) + fsum_indirect2__mm5(a - 1);
+    return (a * 2) + fsum_indirect2__mm07(a - 1);
 }
 
-int fsum_indirect2__mm5(int a) {
+int fsum_indirect2__mm07(int a) {
     if (a == 0) {
         return 0;
     }
-    return a + fsum_indirect1__mm5(a - 1);
+    return a + fsum_indirect1__mm06(a - 1);
 }
 
 // Extended return type forward declaration

@@ -30,9 +30,17 @@ See
 - https://github.com/sdiehl/numpile/commit/353280bc6d3f14bf203924881d02963767d10efb
 - https://github.com/pfalcon/pycopy
 - https://github.com/sdiehl/numpile/issues/14
+- https://gist.github.com/sulami/5fb47f4a36d70f89df8453f5b4236732
+- https://gist.github.com/alendit/defe3d518cd8f3f3e28cb46708d4c9d6
+- https://numba.discourse.group/t/contributing-to-numba-with-no-compiler-or-llvm-experience/597
+- https://blog.yossarian.net/2020/09/19/LLVMs-getelementptr-by-example
+- https://www.reddit.com/r/programming/comments/ivuf99/llvms_getelementptr_by_example/
+- https://groups.seas.harvard.edu/courses/cs153/2019fa/lectures/Lec07-Datastructs.pdf
 """
 
 import ctypes
+from collections import OrderedDict as odict
+import functools
 import os
 import re
 import string
@@ -177,6 +185,53 @@ def get_fn_name(*args):
     return string.join(l, "__")
 
 
+def type_is_scalar(t):
+    # XXX Missing checking the symbol table for typedefs
+    return isinstance(t, str)
+
+def type_is_array(t):
+    return isinstance(t, list)
+
+def type_is_compile_time_sized_array(t):
+    """
+    @return True if the type is an array and its size is known at compile time
+    """
+    res = False
+    if (isinstance(t, list)):
+        if (isinstance(t[0], list)):
+            res = type_is_compile_time_sized_array(t[0])
+        else:
+            res = (t[1] is not None) and (isinstance(t[1].ir_reg, ir.Constant))
+            
+    else:
+        res = False
+
+    return res
+
+def get_array_item_type(t):
+    assert(type_is_array(t))
+
+    a_type = t
+    while (type_is_array(a_type)):
+        a_type, _ = a_type
+        
+    return a_type
+
+def build_type_from_dimensions(item_type, dims):
+    # Convert from dimensions to nested array type, dimesions stay as ir nodes
+    # (with a constant ir_reg or not), or None
+    array_type = item_type
+    # Reverse the order so array can be destructured from oudside in as its 
+    # dimensions are indexed, eg 
+    #   int c[5][4]; 
+    #   type is [[int, 4], 5], so the type of c[5] is [int, 4]
+    for dim in reversed(dims):
+        assert ((dim is None) or (dim.type == "ir"))
+        array_type = [array_type, dim]
+    
+    return array_type
+
+
 def get_llvm_type_ext(t):
     """
     This is used for the contract between the caller and the callee, whether
@@ -271,7 +326,73 @@ def get_llvmlite_type(t):
     assert all((c_type in all_types) for c_type in c_to_llvmlite_types)
     assert all((c_type in c_to_llvmlite_types) for c_type in all_types)
 
-    llvmlite_type = c_to_llvmlite_types[t]
+
+    # First stab at complex types
+    #   "int" is "int"
+    #   "unsigned int" is "unsigned int"
+    #   "int c[10];" 
+    #   - c is ["int", 10] 
+    #   "int c[1][2];" 
+    #   - c is [["int", 2], 1] (note reversed order so type can be destructured 
+    #     by removing the outermost level)
+    #   - c[1] is ["int", 2]
+    #   int c[1][]
+    #   - c is [["int", None], 1]
+    #   - c[1] is ["int", None]
+    #   int c[x][j] (runtime sized array)
+    #   - c is [["int", gen_node], gen_node] with gen_node.ir_reg containing the llvmir expression
+    #   int *c is 
+    #   - c is ["int", None] XXX This makes pointers the same as arrays, should they be different?
+    #   - &c is [["int", None], None]
+    #   - *c is "int" XXX Should simple types be boxed as ["int"] for symmetry?
+    #   int **c 
+    #   - c is [["int", None], None]
+    #   - &c is [[["int", None], None], None]
+    #   - *c is ["int", None]
+    #   struct { int i; float f; } s;
+    #   - s is odict({ 'i' : "int", 'f' : "float" })
+    #   - s.i is "int"
+    #   struct { int i; struct s2 s; } s;
+    #   - s is odict({ 'i' : "int", 's' : "s2" })
+    #   - s.s is "s2"
+    #   struct { int i; float f[2]; } s;
+    #   - s is odict({ 'i' : "int", 'f' : ["float", 2] })
+    #   - s.f is ["float", 2] 
+    #   struct { int i; float f[2]; } s[10];
+    #   - s is [odict({'i' : "int", 'f' : ["float", 2] }), 10]
+    #   - s[0] is odict({'i' : "int", 'f' : ["float", 2] })
+    #   - s[0].f is ["float", 2]
+    #   - s[0].f[1] is "Float"
+    #   - &s is [[odict({'i' : "int", 'f' : ["float", 2] }), 10], None]
+    #   typedef struct { int i; float f; } S; 
+    #   - S is "S"
+    #   typedef struct { int i; float f; } S; S ss[10]; 
+    #   - S is "S"
+    #   - ss is ["S", 10]
+    
+    if (isinstance(t, str)):
+        # Primitive type
+        # XXX or typedef, but typedef not supported yet
+        llvmlite_type = c_to_llvmlite_types[t]
+
+    elif (isinstance(t, list)):
+        # Array or pointer
+        if ((t[1] is not None) and (isinstance(t[1].ir_reg, ir.Constant))):
+            # Compile-time sized array
+            llvmlite_type = ir.ArrayType(get_llvmlite_type(t[0]), t[1].ir_reg.constant)
+
+        else:
+            # Runtime sized array or pointer
+            assert((t[1] is None) or (isinstance(t[1], Struct)))
+            llvmlite_type = get_llvmlite_type(t[0]).as_pointer()
+            
+
+    elif (isinstance(t, odict)):
+        # Struct
+        assert False, "Unsupported struct"
+
+    else:
+        assert False, "Unexpected type %s" % repr(t)
 
     return llvmlite_type
 
@@ -307,13 +428,32 @@ def get_ctype(t):
     assert all((c_type in all_types) for c_type in c_to_ctypes)
     assert all((c_type in c_to_ctypes) for c_type in all_types)
 
-    return c_to_ctypes[t]    
+    
+    if (isinstance(t, str)):
+        # XXX Missing typedefs
+        ctype = c_to_ctypes[t]
+
+    elif (isinstance(t, list)):
+        if ((t[1] is not None) and isinstance(t[1].ir_reg, ir.Constant)):
+            # Compile-time sized array
+            ctype = get_ctype(t[0]) * t[1].ir_reg.constant
+
+        else:
+            # Runtime sized array or pointer
+            assert((t[1] is None) or (isinstance(t[1], Struct)))
+            ctype = ctypes.POINTER(get_ctype(t[0]))
+            
+    else:
+        # XXX Missing structs
+        assert False, "Unsupported type %s" % repr(t)
+
+    return ctype
 
 
 def invoke_clang(c_filepath, ir_filepath, options=""):
     # Generate the precompiled IR in irs.ll
     # clang_filepath = R"C:\android-ndk-r15c\toolchains\llvm\prebuilt\windows-x86_64\bin\clang.exe"
-    clang_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_out", "clang.exe")
+    clang_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_out", "bin", "clang.exe")
     # For privacy reasons and since some ir files are pushed to the repo, don't
     # leak the local path in the LLVM moduleid comment of 
     cmd = R"%s -S -std=c99 -emit-llvm -mllvm --x86-asm-syntax=intel %s -o %s %s" % (
@@ -325,7 +465,7 @@ def invoke_clang(c_filepath, ir_filepath, options=""):
     os.system(cmd)
 
 def invoke_dot(filepath):
-    dot_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_out", "dot.exe")
+    dot_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_out", "bin", "dot.exe")
     cmd = R"%s -Tpng -o %s.png %s" %(
         dot_filepath,
         os.path.relpath(filepath),
@@ -814,44 +954,114 @@ def generate_ir(generator, node):
                 
         return res_type
     
-    def get_ir_ref_reg_and_type(a):
-        # XXX This is wrong in the case of lvalues of complex expressions 
-        #     (pointers, arrays, structs...)
-        # XXX This is old code that probably doesn't make sense with llvmlite ir
-        #     builders, all the variables have a ref
-        
-        # Get reg and type to deal with allocations
-        get_ir_reg_and_type(a)
-
-        a = generator.symbol_table[a.value]
-        assert ((a.type == "variable") or (a.type == "parameter"))
-
-        return a.ir_ref, a.ir_reg, a.value_type
-
     def get_ir_reg_and_type(a):
+        # XXX All this reg and ref should probably be rethought, there's a lot
+        #     of redundant loads ands stores, and on the other hand ephemeral
+        #     stuff is going to the symbol table which can cause data hazards
+        a_ir_ref, a_ir_reg, a_type = get_ir_ref_reg_and_type(a)
+
+        return a_ir_reg, a_type
+
+    def get_ir_ref_reg_and_type(a):
+        a_ir_ref = None
         if (a.type == "identifier"):
             sym = generator.symbol_table[a.value]
             a_type = sym.value_type
             a_ir_type = get_llvmlite_type(a_type)
 
             if (not hasattr(sym, "ir_ref")):
-                # Always create allocas in entry block so they are available
-                # everywhere even across disjoint basic blocks and don't get
-                # reallocated inside loops, etc
-                with generator.llvmir.builder.goto_entry_block():
-                    sym.ir_ref = generator.llvmir.builder.alloca(a_ir_type)
-                
-                    # If it has a register it means that it has an initial value, 
-                    # copy from the register into the storage
+                if (type_is_scalar(a_type)):
+                    # Scalar variable
+
+                    # Create allocas for regular variables and fixed size arrays
+                    # in the entry block so they are available everywhere even
+                    # across disjoint basic blocks and don't get reallocated
+                    # inside loops, etc
+                    with generator.llvmir.builder.goto_entry_block():
+                        sym.ir_ref = generator.llvmir.builder.alloca(a_ir_type)
+
+                elif (type_is_array(a_type) and (
+                        type_is_compile_time_sized_array(a_type) or
+                        (
+                            # Open array of compile-time sized arrays or single
+                            # level open array
+                            ((a_type[1] is None) and 
+                            (
+                                (not type_is_array(a_type[0])) or 
+                                (type_is_compile_time_sized_array(a_type[0]))
+                            ))
+                        )
+                    )):
+                    # Statically sized array or pointer to statically sized
                     
+                    # Create alloca in the entry block so it doesn't get
+                    # continuously allocated 
+                    with generator.llvmir.builder.goto_entry_block():
+                        sym.ir_ref = generator.llvmir.builder.alloca(a_ir_type)
+                
+                else:
+                    # XXX Missing dealing with None dimensions, should look at
+                    #     the initializer to guess the size or do an infinite
+                    #     array (~pointer) in case of parameters, etc
+
+                    # Runtime sized array
+
+                    # Create allocas for runtime sized arrays in the current block
+                    # position to guarantee any expression the runtime size
+                    # depends on has already been calculated. The dynamic array
+                    # will get deallocated via stackrestore when the scope it's
+                    # in finishes and,
+                    # - continue/break will also call stackrestore (necessary eg
+                    #   if a for loop has a runtime sized array allocation and a
+                    #   break/continue in the body scope). 
+                    # - return cleans the stack automatically, so no need for
+                    #   any handling (although this causes mismatches with clang
+                    #   because clang will route early returns to a common 
+                    #   exit point)
+
+                    if (generator.llvmir.stack_ir_reg is None):
+                        # There hasn't been any stack saving in this scope, save it
+                        stack_ir_reg = generate_save_stack_ir(generator)
+
+                        # Stash it away so scope closing, opening, continue and
+                        # break can snoop it
+                        generator.llvmir.stack_ir_reg = stack_ir_reg
+
+                    # Multiply all dimensions to get the total size
+                    a_type, dim = sym.value_type
+                    size_ir_reg = dim.ir_reg
+                    # XXX This should use something more abstract like size_t
+                    size_t_type = "unsigned long long"
+                    size_ir_reg = generate_type_conversion_ir(generator, dim, size_t_type)
+                    while (type_is_array(a_type)):
+                        a_type, dim = a_type
+                        dim_ir_reg = generate_type_conversion_ir(generator, dim, size_t_type)
+                        size_ir_reg = generator.llvmir.builder.mul(size_ir_reg, dim_ir_reg)
+                    
+                    # Allocate the runtime sized array in the current block
+                    # position 
+                    # Note we have to allocate for the item type (eg int), not
+                    # for the array type (eg int**)
+                    sym.ir_ref = generator.llvmir.builder.alloca(get_llvmlite_type(a_type), size_ir_reg)
+                    # XXX Setting align = 16 to match clang, revisit
+                    sym.ir_ref.align = 16
+                    # Return the full type since the dimensions ir will be
+                    # needed for working out the indexing
+                    a_type = sym.value_type
+
+                                    
+                # If it has a register it means that it has an initial value, 
+                # copy from the register into the storage
+                # XXX Should things get reset on every basic block?
+                if (hasattr(sym, "ir_reg")):
+                    # This needs to happen in the entry block so disjoint blocks
+                    # get the right value
                     # Note only parameters have an ir_reg without an ir_ref.
                     # Initialized variables will get the alloca correctly
                     # bubbled up, but the expression and assign initializing
                     # them will remain in the disjoint basic block
-
-                    # XXX Should things get reset on every basic block?
-                    if (hasattr(sym, "ir_reg")):
-                        assert(sym.type == "parameter")
+                    assert(sym.type == "parameter")
+                    with generator.llvmir.builder.goto_entry_block():
                         generator.llvmir.builder.store(sym.ir_reg, sym.ir_ref)
 
             # Load from the storage to a new register to make sure the register
@@ -867,7 +1077,12 @@ def generate_ir(generator, node):
             #     and not available on another (eg regs created in a "then" block
             #     are not available on "else" blocks)
             sym.ir_reg = generator.llvmir.builder.load(sym.ir_ref)
+            a_ir_ref = sym.ir_ref
+            
             a_ir_reg = sym.ir_reg
+
+            a_ir_reg.name = sym.name
+            a_ir_ref.name = sym.name + "_ref"
             
         elif (a.type == "constant"):
             a_type = a.value_type
@@ -877,8 +1092,12 @@ def generate_ir(generator, node):
         else:
             a_ir_reg = a.ir_reg
             a_type = a.value_type
+            # Some ir will have ir_ref (pointers and arrays expressions), some
+            # won't
+            if (hasattr(a, "ir_ref")):
+                a_ir_ref = a.ir_ref
 
-        return a_ir_reg, a_type
+        return a_ir_ref, a_ir_reg, a_type
 
     def create_function(function_name, function_type, parameters):
         fn = Struct(
@@ -1010,6 +1229,34 @@ def generate_ir(generator, node):
 
         return res_ir_reg, res_type
 
+    def generate_type_conversion_ir(generator, a, res_type):
+        # XXX Go through the code and replace all replicas of this snippet with
+        #     the call
+        a_ir_reg, a_type = get_ir_reg_and_type(a)
+        if (a_type != res_type):
+            a_ir_reg = generate_extern_call_ir(generator, 
+                get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_ir_reg])
+
+        return a_ir_reg
+
+    def generate_save_stack_ir(generator):
+        # XXX A lot of this could be cached
+        pint8 = ir.IntType(8).as_pointer()
+        stacksave_ir_type = ir.FunctionType(pint8, [])
+        stacksave_fn_ir = generator.llvmir.module.declare_intrinsic("llvm.stacksave", fnty=stacksave_ir_type) 
+        stack_ir_reg = generator.llvmir.builder.call(stacksave_fn_ir, []) 
+
+        return stack_ir_reg
+
+    def generate_restore_stack_ir(generator):
+        # XXX A lot of this could be cached
+        if (generator.llvmir.stack_ir_reg is not None):
+            pint8 = ir.IntType(8).as_pointer()
+            stackrestore_ir_type = ir.FunctionType(ir.VoidType(), [pint8])
+            stackrestore_fn_ir = generator.llvmir.module.declare_intrinsic("llvm.stackrestore", fnty=stackrestore_ir_type)
+            generator.llvmir.builder.call(stackrestore_fn_ir, [generator.llvmir.stack_ir_reg])
+
+
     def generate_assign_ir(generator, a, b):
         a_ir_ref, a_ir_reg, a_type = get_ir_ref_reg_and_type(a)
         b_ir_reg, b_type = get_ir_reg_and_type(b)
@@ -1084,8 +1331,13 @@ def generate_ir(generator, node):
 
 
     gen_node = None
+    generator.depth += 1
+    debug = (__name__ == "__main__")
+    
     # Node can be Token or Tree
     if (type(node) is lark.Tree):
+        if (debug):
+            print "  " * generator.depth, "enter", node.data
         # XXX When there's more than one child we need to special case some
         #     of the rules so we avoid returning too much nesting or long
         #     lists that make things down the line  harder or
@@ -1096,8 +1348,22 @@ def generate_ir(generator, node):
         #     maybe it could be massaged at load time?
         if (node.data == "compound_statement"):
             # compound_statement:  "{" block_item_list? "}"
+
             generator.symbol_table.push_scope()
+
+            stack_ir_reg = generator.llvmir.stack_ir_reg
+            generator.llvmir.stack_ir_reg = None
+    
             gen_node = generate_ir(generator, node.children[1])
+
+            # If this scope stashed a stack register, restore the sack, since 
+            # the scope is gone no code will access whatever variable caused
+            # the stack to be saved
+            generate_restore_stack_ir(generator)
+                
+            # Put back whatever stack register the parent block stashed or not
+            generator.llvmir.stack_ir_reg = stack_ir_reg
+            
             generator.symbol_table.pop_scope()
 
         elif (node.data == "argument_expression_list"):
@@ -1149,6 +1415,112 @@ def generate_ir(generator, node):
 
                 res_ir_reg, res_type = generate_call_ir(generator, fn_name, arg_ir_reg_types)
                 gen_node = Struct(type="ir", value_type=res_type, ir_reg=res_ir_reg)
+
+            elif (node.children[1] == "["):
+                def get_array_item_type(t):
+                    if (isinstance(t[0], list)):
+                        res = get_array_item_type(t[0])
+                    else:
+                        res = t[0]
+
+                # |  postfix_expression "[" expression "]"
+                gen_node = generate_ir(generator, node.children[0])
+                assert(isinstance(gen_node, Struct))
+
+                # There are three ways of using getelementptr (gep)
+
+                # 1. pass the fully specified type, all the indices, and let gep
+                #    do the heavy lifting. This is nice but a) only works with
+                #    arrays fully specified (all the dimensions known at compile
+                #    time) b) doesn't allow piecemeal construction of the
+                #    address as the postfix expressions are parsed
+                # 2. pass the fully specified type and one index at a time,
+                #    which allows for piecemeal construction of the address as
+                #    the postfix expression is parsed. This is what is done here
+                #    when the dimensions of the array are known at compile time
+                # 3. Lower the multidimensional array to a pointer and do the
+                #    calculation manually. This is what is done when the type
+                #    is not fully specified at compile time (eg runtime sized
+                #    arrays).
+
+                # Note there's always an initial 0 index to convert the "pointer
+                # to array" to "array" 
+                #
+                #   int b[3][5];
+                #   b[2][1] = 1;
+                #
+                #   %4 = getelementptr inbounds [3 x [5 x i32]], [3 x [5 x i32]]* %3, i64 0, i64 2, !dbg !22
+                #   %5 = getelementptr inbounds [5 x i32], [5 x i32]* %4, i64 0, i64 1, !dbg !22
+                # 
+                #  or, for runtime sized arrays   
+                #
+                #   int b[3][i];
+                #   b[2][1] = 1;
+                #
+                # .. manual offset calculation into %11 and %12 ...
+                #
+                #  %11 = getelementptr inbounds i32, i32* %9, i64 %10, !dbg !27
+                #  %12 = getelementptr inbounds i32, i32* %11, i64 1, !dbg !27
+                
+                ir_ref, ir_reg, a_type = get_ir_ref_reg_and_type(gen_node)
+                
+                ind = generate_ir(generator, node.children[2])
+
+                # Convert index to 64-bit if necessary
+                # XXX Should use something more abstract like size_t
+                size_t_type = "unsigned long long"
+                ind_ir_reg = generate_type_conversion_ir(generator, ind, size_t_type)
+
+                # XXX The gep's below are setting inbounds=True to match clang,
+                #     revisit
+                if (type_is_compile_time_sized_array(a_type)):
+                    # Dimensions are known at compile time, let getelementptr
+                    # work out the address calculation
+    
+                    if (a_type[1] is None):
+                        # Pointer, use ir_reg and don't 0 dereference
+                        ptr = generator.llvmir.builder.gep(ir_reg, [ind_ir_reg], True)
+
+                    else:
+                        # Array, use ir_ref and 0 dereference
+                        ptr = generator.llvmir.builder.gep(ir_ref, [ir.IntType(32)(0)] + [ind_ir_reg], True)
+
+                else:
+                    # Dimensions are not known at compile time, work out the
+                    # calculation manually and just use getelementptr to lower
+                    # the type
+                    assert type_is_array(a_type)
+                    
+                    # Don't multiply by the dimension for the last slice
+                    if (type_is_array(a_type[0])):
+                        dim = a_type[1]
+                        # Convert dimensions to 64-bit if necessary (done here
+                        # instead of at array definition time time since they
+                        # could come from a function parameter, which cannot
+                        # generate code when it's parsed)
+
+                        # XXX Should store these back into the type, but careful
+                        #     with the disjoint block issues (and then again the 
+                        #     optimizer removes any redundant calculations, so
+                        #     it's low priority)
+                        dim_ir_reg = generate_type_conversion_ir(generator, dim, size_t_type)
+                        ind_ir_reg = generator.llvmir.builder.mul(ind_ir_reg, dim_ir_reg)
+                    
+                    if (a_type[1] is None):
+                        # Pointer, use ir_reg
+                        ptr = generator.llvmir.builder.gep(ir_reg, [ind_ir_reg], True)
+
+                    else:
+                        # Array, use ir_ref
+                        ptr = generator.llvmir.builder.gep(ir_ref, [ind_ir_reg], True)
+                    
+                # XXX This load is overkill since most of the time this is
+                #     generated for partial indexing which is thrown away, can
+                #     it be delayed? (not a big deal since the optimizer removes
+                #     it anyway)
+                ir_reg = generator.llvmir.builder.load(ptr)
+                # Lower the C type by removing the last dimension
+                gen_node = Struct(type="ir", value_type=a_type[0], ir_reg=ir_reg, ir_ref=ptr)
 
             else:
                 # XXX Support the rest of postfix_expression
@@ -1217,7 +1589,7 @@ def generate_ir(generator, node):
                 gen_node = generate_ir(generator, node.children[1])
             else:
                 gen_node = generate_ir(generator, node.children[0])
-
+            
         elif (node.data.endswith("_expression") and (len(node.children) == 3)):
             # Cach all two operands + sign expressions
 
@@ -1248,6 +1620,17 @@ def generate_ir(generator, node):
 
                 gen_node = generate_binop_ir(generator, a, b, op_sign)
 
+        elif (node.data == "expression"):
+            # expression:  assignment_expression
+            #   |  expression "," assignment_expression
+            if (len(node.children) == 1):
+                gen_node = generate_ir(generator, node.children[0])
+
+            else:
+                gen_node = generate_ir(generator, node.children[0])
+                # Last expression is the value of the assignment expression
+                gen_node = generate_ir(generator, node.children[2])
+
         elif (node.data == "expression_statement"):
             # expression_statement:  expression? ";"
             if (len(node.children) > 1):
@@ -1259,6 +1642,12 @@ def generate_ir(generator, node):
             #     |  "break" ";"
             #     |  "return" expression? ";"
             if (node.children[0].value == "return"):
+                # Note there's no need to restore the stack register on return
+                # since there could be multiple of them stacked and the stack
+                # is cleaned up by return anyway
+                # XXX This causes a mismatch wrt to clang which does seems to
+                #     have a single return point and does cleanup. Maybe look
+                #     into doing that too?
                 function_name = generator.llvmir.function.name
                 fn = generator.symbol_table[function_name]
                     
@@ -1287,10 +1676,14 @@ def generate_ir(generator, node):
                 goto_unreachable_block()
                 
             elif (node.children[0].value == "break"):
+                generate_restore_stack_ir(generator)
+
                 generate_branch_ir(generator.llvmir.break_bb)
                 goto_unreachable_block()
                 
             elif (node.children[0].value == "continue"):
+                generate_restore_stack_ir(generator)
+
                 generate_branch_ir(generator.llvmir.continue_bb)
                 goto_unreachable_block()
 
@@ -1307,6 +1700,7 @@ def generate_ir(generator, node):
             
             if (len(node.children) == 1):
                 gen_node = [generate_ir(generator, node.children[0])]
+
             else:
                 gen_node = generate_ir(generator, node.children[0])
                 gen_node.append(generate_ir(generator, node.children[2]))
@@ -1341,9 +1735,10 @@ def generate_ir(generator, node):
             
             # Collect parameters, note they could be empty
             parameters = []
-            if (gen_node[2] != ")"):
-                parameters = gen_node[2]
-            if (fn is None):            
+            if (len(gen_node) > 1):
+                parameters = gen_node[1]
+                
+            if (fn is None):
                 fn = create_function(function_name, function_type, parameters)
             
                 generator.symbol_table[function_name] = fn 
@@ -1394,6 +1789,16 @@ def generate_ir(generator, node):
 
             generator.function = None
 
+        elif (node.data == "identifier_list"):
+            # identifier_list:  identifier
+            #   |  identifier_list "," identifier
+            if (len(node.children) > 1):
+                gen_node = generate_ir(generator, node.children[0])
+                gen_node.append(generate_ir(generator, node.children[2]))
+            else:
+                gen_node = [generate_ir(generator, node.children[0])]
+
+
         elif (node.data == "parameter_list"):
             # parameter_list:  parameter_declaration 
             #   |  parameter_list "," parameter_declaration
@@ -1404,8 +1809,10 @@ def generate_ir(generator, node):
             if (len(node.children) > 1):
                 gen_node = generate_ir(generator, node.children[0])
                 gen_node.append(generate_ir(generator, node.children[2]))
+                 
             else:
                 gen_node = [generate_ir(generator, node.children[0])]
+                
 
         elif (node.data == "parameter_declaration"):
             # parameter_declaration:  declaration_specifiers declarator
@@ -1418,8 +1825,19 @@ def generate_ir(generator, node):
             parameter_name = None
             parameter_type = gen_node[0]
             if (len(gen_node) > 1):
-                parameter_name = gen_node[1].value
-            
+                assert (isinstance(gen_node[1], str) or (
+                    isinstance(gen_node[1], Struct) and gen_node[1].type == "identifier"))
+
+                identifier = gen_node[1]
+                if (identifier.dims is not None):
+                    # Array, build the type
+                    parameter_type = build_type_from_dimensions(parameter_type, identifier.dims)
+                    # Array parameters are passed by reference, convert the last 
+                    # dimension to pointer
+                    parameter_type = [parameter_type[:-1][0], None]
+                        
+                parameter_name = identifier.value
+
             # Don't put the parameters in the symbol table yet, since this could
             # be a forward declaration that should not put them because we don't
             # want to modify the overflow with forward declarations, and we may
@@ -1472,16 +1890,16 @@ def generate_ir(generator, node):
                 # XXX Should this check it matches the existing declaration?
                 if (function_name not in generator.symbol_table):
                     parameters = []
-                    if (gen_node[0][0][2] != ")"):
-                        parameters = gen_node[0][0][2]
+                    if (len(gen_node[0][0]) > 1):
+                        parameters = gen_node[0][0][1]
                     fn = create_function(function_name, function_type, parameters)
                     generator.symbol_table[function_name] = fn
 
             else:
                 # Local scope variable, stored in the stack
                 
-                # The declarator list may contain initializer so it needs
-                # generating
+                # The declarator list may contain initializer so we cannot
+                # just snoop whatever data, it needs generating
                 if (len(node.children) > 1):
                     gen_node = generate_ir(generator, node.children[1])
                     
@@ -1489,6 +1907,13 @@ def generate_ir(generator, node):
                 # initializer, if any
                 decl_type = generate_ir(generator, node.children[0])
                 for identifier, initializer in gen_node:
+                    if (identifier.dims is None):
+                        # No dimensions
+                        dims = None
+
+                    else:
+                        decl_type = build_type_from_dimensions(decl_type, identifier.dims)
+                        
                     variable = Struct(
                         type="variable", 
                         name=identifier.value, 
@@ -1506,7 +1931,66 @@ def generate_ir(generator, node):
                         generate_assign_ir(generator, a, b)
                         
             gen_node = Struct(type="ir", value_type="void", ir_reg=None)
+
+        elif(node.data == "direct_declarator"):
+            # direct_declarator:  identifier
+            # |  "(" declarator ")"
+            # |  direct_declarator "[" type_qualifier_list? assignment_expression? "]"
+            # |  direct_declarator "[" "static" type_qualifier_list? assignment_expression "]"
+            # |  direct_declarator "[" type_qualifier_list "static" assignment_expression "]"
+            # |  direct_declarator "[" type_qualifier_list? "*" "]"
+            # |  direct_declarator "(" parameter_type_list ")"
+            # |  direct_declarator "(" identifier_list? ")"
             
+            # Flatten and push up left recursive lists
+            if (node.children[0].data == "identifier"):
+                gen_node = generate_ir(generator, node.children[0])
+
+            elif (node.children[1].value == "("):
+                # Function declarations, including empty and prototypes
+                gen_node = generate_ir(generator, node.children[0])
+
+                if (len(node.children) > 3):
+                    # Gather identifier_list or parameter_type_list
+                    assert isinstance(gen_node, str) or isinstance(gen_node, Struct)
+                    gen_node = [gen_node] + [generate_ir(generator, node.children[2])]
+
+                else:
+                    gen_node = [gen_node]
+
+            elif ((node.children[0].data == "direct_declarator") and 
+                  (node.children[1].value == "[")):
+                # |  direct_declarator "[" type_qualifier_list? assignment_expression? "]"
+                # |  direct_declarator "[" "static" type_qualifier_list? assignment_expression "]"
+                # |  direct_declarator "[" type_qualifier_list "static" assignment_expression "]"
+                # |  direct_declarator "[" type_qualifier_list? "*" "]"
+                
+                # Array declarations, including empty, return a list of type,
+                # identifier with dims field with dimensions which can be None
+                # (no dimensions), or an ir (which can be constant or not)
+                
+                gen_node = generate_ir(generator, node.children[0])
+                assert isinstance(gen_node, str) or isinstance(gen_node, Struct)
+                if (len(node.children) == 2):
+                    # Unsized array, return None dimensions
+                    dim = None
+
+                else:
+                    # XXX No support for qualified arrays yet
+                    assert (node.children[-2].data == "assignment_expression")
+                    # XXX The expression handler could have some minimal compile
+                    #     time constant folding to avoid creating runtime arrays
+                    #     when using simple constant expressions
+                    dim = generate_ir(generator, node.children[-2])
+                    
+                    
+                if (gen_node.dims is None):
+                    gen_node.dims = [dim]
+                else:
+                    gen_node.dims.append(dim)
+                    
+            else:
+                assert False, "Unhandled direct_declarator"
 
         elif (node.data == "block_item_list"):
             # block_item_list:  block_item
@@ -1570,7 +2054,7 @@ def generate_ir(generator, node):
 
 
         elif (node.data == "identifier"):
-            gen_node = Struct(type="identifier", value=node.children[0].value)
+            gen_node = Struct(type="identifier", value=node.children[0].value, dims=None)
 
         elif ((node.data == "type_name") or (node.data == "declaration_specifiers")):
             # type_name:  specifier_qualifier_list abstract_declarator?
@@ -1729,6 +2213,7 @@ def generate_ir(generator, node):
                     if (a_type != res_type):
                         a_ir_reg = generate_extern_call_ir(generator, 
                             get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_ir_reg])
+                        a_ir_reg.name = "forcond"
 
                     # Jump to exit or to start of loop
                     generate_cbranch_ir(a_ir_reg, loop_body_bb, loop_end_bb)
@@ -1744,7 +2229,8 @@ def generate_ir(generator, node):
                 if (node.children[next_child] != ")"):
                     # Generate the loop increment
                     gen_node = generate_ir(generator, node.children[next_child])
-
+                    gen_node.ir_reg.name = "forcounter"
+                    
                     next_child += 1
                 generate_branch_ir(loop_cond_bb)
 
@@ -1785,6 +2271,7 @@ def generate_ir(generator, node):
                 if (a_type != res_type):
                     a_ir_reg = generate_extern_call_ir(generator, 
                         get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_ir_reg])
+                    a_ir_reg.name = "ifcond"
                 
                 builder = generator.llvmir.builder
                 if_then_bb = builder.function.append_basic_block("ifthen")
@@ -1824,13 +2311,17 @@ def generate_ir(generator, node):
             gen_node = []
             for child in node.children:
                 gen_node.append(generate_ir(generator, child))
-        
+
+        if (debug):
+            print "  " * generator.depth, "leave", node.data, str(gen_node)[:100].replace("\n", " - ")
+
     elif (isinstance(node, lark.Token)):
         gen_node = node.value
 
     else:
         assert False, "Unexpected node type %s" % node
     
+    generator.depth -= 1
     return gen_node
 
 
@@ -1993,8 +2484,68 @@ def llvm_compile(llvm_ir, function_signatures):
                 f.write(dot)
             invoke_dot(dot_filepath)
 
-        # Run the function via ctypes
+        # Obtain a pointer to the function via ctypes
         cfunc = ctypes.CFUNCTYPE(*function_signature.ctypes)(func_ptr)
+        
+        # Convert the Python arguments to ctype arguments by wrapping the ctype
+        # function in a Python wrapper
+        if (any(
+                [(issubclass(ctype, ctypes.Array) or issubclass(ctype, ctypes._Pointer)) 
+                for ctype in function_signature.ctypes[1:]]
+            )):
+            # Nested arrays need to be converted to nested tuples
+            def wrapper(_cfunc, *args):
+                def tuplize(a):
+                    if (isinstance(a, list)):
+                        l = []
+                        for i in a:
+                            l.append(tuplize(i))
+                        return tuple(l)
+                    else:
+                        return a
+
+                _args = []
+                
+                for arg, ctype in zip(args, _cfunc.argtypes):
+                    if (issubclass(ctype, ctypes.Array)):
+                        # Pass the list straight
+                        _args.append(ctype(*tuplize(arg)))
+
+                    elif (issubclass(ctype, ctypes._Pointer)):
+                        # Pointer to array, ignore the pointer, pass an array
+                        tup = tuplize(arg)
+                        c_arr = (len(tup) * ctype._type_)(*tup)
+                        _args.append(c_arr)
+
+                    else:
+                        _args.append(ctype(arg))
+
+                # Invoke the function
+                res = _cfunc(*_args)
+                
+                # copy back
+                for arg, ctype, _arg in zip(args, _cfunc.argtypes, _args):
+                    if (issubclass(ctype, ctypes.Array)):
+                        assert False, "Missing copy back for array"
+
+                    elif (issubclass(ctype, ctypes._Pointer)):
+                        def deepcopy_list(l, c_arr):
+                            for i in xrange(len(l)):
+                                if (isinstance(l[i], list)):
+                                    deepcopy_list(l[i], c_arr[i])
+                                else:
+                                    l[i] = c_arr[i]
+
+                        deepcopy_list(arg, c_arr)
+
+                    # XXX Other copybacks probably missing like structs, etc
+                    #     May go through the pointer path?
+                return res
+
+            # XXX Ideally this hould only override the __call__ so the 
+            #     user still sees a ctypes function
+            cfunc = functools.partial(wrapper, cfunc)
+        
         setattr(jit_lib, function_signature.name, cfunc)
 
     # XXX Missing publishing the globals once there's global support
@@ -2080,10 +2631,23 @@ def epycc_generate(source, debug = False):
 
     generator = Struct(
         symbol_table = SymbolTable(), 
-        llvmir = Struct(module=ir.Module(), break_bb = None, continue_bb = None, function=None, externs=dict())
+        depth = 0,
+        llvmir = Struct(
+            module=ir.Module(), 
+            # Basic blocks to branch to in case of break or continue
+            break_bb = None, continue_bb = None, 
+            function=None, externs=dict(),
+            # Register holding the current stacksave value
+            stack_ir_reg = None,
+        )
     )
-    
-    generate_ir(generator, tree)
+
+    try:    
+        generate_ir(generator, tree)
+    except Exception as e:
+        if (hasattr(generator, "llvmir") and hasattr(generator.llvmir, "function")):
+            print "Generation exception in function\n", str(generator.llvmir.function)
+        raise
 
     epycc_dirpath = os.path.dirname(os.path.abspath(__file__))
     generated_c_filepath = os.path.join(epycc_dirpath, "generated", "irs.c")
@@ -2115,8 +2679,22 @@ def epycc_generate(source, debug = False):
             )
 
             function_signatures.append(function_signature)
-
     
+
+    # Dump the intrinsic declarations needed by this module
+    
+    # XXX In general dumping functions individually above to avoid redeclaring
+    #     epycc internal functions is prone to errors once more global symbols
+    #     and declarations are introduced, and should be done in a different
+    #     way, probably removing the internal functions before dumping the whole
+    #     module?
+    llvm_irs.append("; Intrinsic declarations")
+    for module_global in generator.llvmir.module.globals:
+        if (module_global.startswith("llvm.")):
+            llvm_irs.append(str(generator.llvmir.module.globals[module_global]))
+
+
+
     for function_extern in function_externs:
         # Dump the extern functions needed by this module
         extern = all_externs[function_extern]
@@ -2330,6 +2908,7 @@ def llvm_ir_diff(filepath_a, filepath_b, function_names = None):
     mismatch_count = 0
     # tuples of a,b instructions mismatching, indexed by function name
     mismatches = {}
+    side_by_sides = {}
 
     with open(filepath_a, "r") as f:
         llvm_ir_a = f.read()
@@ -2364,9 +2943,14 @@ def llvm_ir_diff(filepath_a, filepath_b, function_names = None):
             #     bhave the function
             mismatches[fn_a.name] = [instr for instr in str(fn_a).splitlines()]
             continue
+
+        # Ignore functions with no blocks (declarations)
+        if ((len(list(fn_a.blocks)) == 0) or (len(list(fn_b.blocks)) == 0)):
+            continue
             
         function_mismatch_count = 0
         mismatches[fn_a.name] = []
+        side_by_sides[fn_a.name] = set()
 
         # Get the entry blocks
         block_a = list(fn_a.blocks)[0]
@@ -2393,13 +2977,36 @@ def llvm_ir_diff(filepath_a, filepath_b, function_names = None):
         block_str_to_block = dict()
 
         pending_block_pairs_queue = [(block_a, block_b)]
+        pending_block_pairs = set(pending_block_pairs_queue)
         done_block_pairs = set()
+        remapping_table_length_at_enqueue_time = {}
         while (len(pending_block_pairs_queue) > 0):
             block_pair = pending_block_pairs_queue.pop(0)
-            done_block_pairs.add(block_pair)
+            pending_block_pairs.remove(block_pair)
+            debug_queue = False
+            if (debug_queue):
+                print "popped", [hash(b) for b in block_pair],
+                print [(hash(ba), hash(bb)) for ba, bb in pending_block_pairs_queue]
+
+            original_pending_block_pairs_queue = tuple(pending_block_pairs_queue)
+            original_remapping_table_length = len(remapping_table)
+
+            table_length_queue = remapping_table_length_at_enqueue_time.get(block_pair, None)
+            can_revisit = True
+            if (table_length_queue is not None):
+                if (
+                    (table_length_queue.remapping_table_length == len(remapping_table)) and
+                    (set(table_length_queue.pending_block_pairs_queue) == set(tuple(pending_block_pairs_queue)))
+                ):
+                    can_revisit = False
+                # No need to keep this around unless revisiting again
+                #del remapping_table_length_at_enqueue_time[block_pair]
+            
             block_a, block_b = block_pair
             instructions_a = block_a.instructions
             instructions_b = block_b.instructions
+
+            side_by_sides[fn_a.name].add(block_pair)
 
             # Create a list to be sorted with [(index, instruction_a, instruction_b), ...] 
             # Reorder the phi instructions wrt to a sort func
@@ -2413,8 +3020,9 @@ def llvm_ir_diff(filepath_a, filepath_b, function_names = None):
                 print "b sorted\n", string.join([str(instr) for instr in instructions_sorted_b], "\n")
 
             needs_revisiting = False
-            # Fill with empty strings so they are detected as mismatches
-            # Note this works because it gets handled as different token lengths
+            # If blocks have different number of instructions, fill with empty
+            # strings so they are detected as mismatches (will be detected as a
+            # mismatch because of different token lengths)
             delta_len_a_b = len(instructions_sorted_a) - len(instructions_sorted_b)
             instructions_sorted_b.extend([""] * (max(delta_len_a_b, 0)))
             instructions_sorted_a.extend([""] * (max(-delta_len_a_b, 0)))
@@ -2426,99 +3034,205 @@ def llvm_ir_diff(filepath_a, filepath_b, function_names = None):
                 tokens_a = re.split(r"[ ,\n]+", str_instr_a)
                 tokens_b = re.split(r"[ ,\n]+", str_instr_b)
 
+                # epycc doesn't fill Type Based Alias Analysis info, remove
+                # those tokens
+                #   store i32 0, i32* %13, align 4, !tbaa !3
+                # XXX See if epycc needs to support TBAA?
+                if ("!tbaa" in tokens_a):
+                    tokens_a = tokens_a[:tokens_a.index("!tbaa")]
+
+                if ("!tbaa" in tokens_b):
+                    tokens_b = tokens_b[:tokens_b.index("!tbaa")]
+
+                # If the instruction has different lengths, or opcodes, or
+                # non-register tokens that cannot be rearranged, no remapping
+                # will make it match, add to mismatches early
+                mismatch_found = False
                 if ((len(tokens_a) != len(tokens_b)) or 
                     (instr_a.opcode != instr_b.opcode) or 
                     ((instr_a.opcode != "phi") and any([token_a != token_b 
                         for token_a, token_b in zip(tokens_a, tokens_b) if not token_b.startswith("%")]))):
-                    function_mismatch_count += 1
-                    mismatches[fn_a.name].append((str_instr_a, str_instr_b))
-                    continue
 
-                remapping_table.update({token_b : token_b for token_b in tokens_b if token_b[0] != "%"})
+                    mismatch_found = True
 
-                # Phi instructions 
-                #   %indvars.iv10 = phi i32 [ %indvars.iv.next11, %forend.1 ], [ -4, %entry ]
-                # select over depending on where it came from
-                # the selection options can be randomly sorted, so we need
-                # to ensure they are compared properly.
-                
-                # If it's a phi node, reorder the options tokens
-                # alphabetically wrt the remapping, this requires the
-                # remapping to be available for those options
+                else:
+                    # Try to remap registers to make instructions match
 
-                # ['%10', '=', 'phi', 'i32', '[', '%5', '%4', ']', '[', '%8', '%7', ']']
-                # ['%merge', '=', 'phi', 'i32', '[', '%2', '%dobody.endif', ']', '[', '%.4.0', '%dobody', ']']
-                if (instr_a.opcode == "phi"):
-                    # If not all the tokens are in the remapping table, put
-                    # the block back in the queue to revisit later
+                    remapping_table.update({token_b : token_b for token_b in tokens_b if token_b[0] != "%"})
+
+                    # Phi instructions 
+                    #   %indvars.iv10 = phi i32 [ %indvars.iv.next11, %forend.1 ], [ -4, %entry ]
+                    # select over depending on where it came from
+                    # the selection options can be randomly sorted, so we need
+                    # to ensure they are compared properly.
                     
-                    # XXX This needs to check for infinite loops?
-                    if (any([token_b not in remapping_table for token_b in tokens_b])):
-                        needs_revisiting = True
-                        continue
+                    # If it's a phi node, reorder the options tokens
+                    # alphabetically wrt the remapping, this requires the
+                    # remapping to be available for those options
 
-                    else:
-                        phi_operands_a = sort_phi_operands(tokens_a, False, False)
-                        phi_operands_b = sort_phi_operands(tokens_b, True, False)
-
-                        tokens_a = tokens_a[:4] + phi_operands_a
-                        tokens_b = tokens_b[:4] + phi_operands_b
-
-                mismatch_found = False
-                for token_a, token_b in zip(tokens_a, tokens_b):
-                    if (token_b in remapping_table):
-                        if (remapping_table[token_b] != token_a):
-                            mismatch_found = True
-                            break
+                    # ['%10', '=', 'phi', 'i32', '[', '%5', '%4', ']', '[', '%8', '%7', ']']
+                    # ['%merge', '=', 'phi', 'i32', '[', '%2', '%dobody.endif', ']', '[', '%.4.0', '%dobody', ']']
+                    if (instr_a.opcode == "phi"):
+                        # If not all the tokens are in the remapping table, put
+                        # the block back in the queue to revisit later
                         
-                    else:
-                        remapping_table[token_b] = token_a
+                        if (any([token_b not in remapping_table for token_b in tokens_b])):
+                            # Tag the block as needing revisit, but still look
+                            # at the other instructions to find more mismatches
+                            # or blocks to traverse
+                            needs_revisiting = can_revisit
+
+                        else:
+                            phi_operands_a = sort_phi_operands(tokens_a, False, False)
+                            phi_operands_b = sort_phi_operands(tokens_b, True, False)
+
+                            tokens_a = tokens_a[:4] + phi_operands_a
+                            tokens_b = tokens_b[:4] + phi_operands_b
+
+                    if (not needs_revisiting):
+                        for token_a, token_b in zip(tokens_a, tokens_b):
+                            if (token_b in remapping_table):
+                                if (remapping_table[token_b] != token_a):
+                                    mismatch_found = True
+                                    break
+                                
+                            else:
+                                remapping_table[token_b] = token_a
 
                 if (mismatch_found):
-                    # There was a mismatch, done with this instruction
+                    # There was a mismatch, account it but keep going to find
+                    # more mismatches on other blocks
                     function_mismatch_count += 1
-                    mismatches[fn_a.name].append((str(instr_a), str(instr_b)))
-
-                    continue
+                    mismatches[fn_a.name].append((str_instr_a, str_instr_b))
 
                 # Find other blocks to traverse by pushing to the queue operands
                 # of type "label"
-                for operand_a, operand_b in zip(instr_a.operands, instr_b.operands):
-                    # instr.opcode is a string with the opcode, but has information
-                    # missing, eg "icmp" for "icmp gte" 
+                # If the instruction is the empty string, it means one of the
+                # blocks has less instructions, so even if the other instruction
+                # contained labels, we wouldn't know what block to pair it with,
+                # so don't bother queueing any blokcs in that case 
+                # XXX Ideally we would add that whole block as mismatches, but
+                #     we may match that block in another way, so we cannot
+                #     naively do it
+                if (isinstance(instr_a, llvm.ValueRef) and isinstance(instr_b, llvm.ValueRef)):
+                    for operand_a, operand_b in zip(instr_a.operands, instr_b.operands):
+                        # instr.opcode is a string with the opcode, but has
+                        # information missing, eg "icmp" for "icmp gte" 
 
-                    # str(operand) returns type and name, but name is empty for auto-gen
-                    # for labels, the str() gives the full basic block the label 
-                    # points to
+                        # str(operand) returns type and name, but name is empty for
+                        # auto-gen for labels, the str() gives the full basic block
+                        # the label points to, do a full text search for that block
+                        # and add it to the queue
 
-                    if (str(operand_a.type) == "label"):
-                        # Find the block by string search
-                        next_block_a = search_block(str(operand_a), fn_a.blocks)
-                        next_block_b = search_block(str(operand_b), fn_b.blocks)
-                        
-                        assert(next_block_a is not None)
-                        assert(next_block_b is not None)
-                        
-                        next_block_pair = (next_block_a, next_block_b)
-                        if (next_block_pair not in done_block_pairs):
-                            pending_block_pairs_queue.append(next_block_pair)
+                        if (str(operand_a.type) == "label"):
+                            # Find the block by string search
+                            next_block_a = search_block(str(operand_a), fn_a.blocks)
+                            next_block_b = search_block(str(operand_b), fn_b.blocks)
+                            
+                            assert(next_block_a is not None)
+                            assert(next_block_b is not None)
+                            
+                            next_block_pair = (next_block_a, next_block_b)
+                            if ((next_block_pair not in done_block_pairs) and 
+                                (next_block_pair not in pending_block_pairs) and 
+                                (next_block_pair != block_pair)
+                               ):
+                                
+                                pending_block_pairs_queue.append(next_block_pair)
+                                pending_block_pairs.add(next_block_pair)
+                                if (debug_queue):
+                                    print "queued", [hash(b) for b in next_block_pair],
+                                    print [(hash(ba), hash(bb)) for ba, bb in pending_block_pairs_queue]
 
-            # Re-enqueue if this block needs revisiting, but don't do it if
-            # there are mismatches since it could prevent completing the
-            # remapping table and loop forever
-            if (needs_revisiting and (function_mismatch_count == 0)):
+            # Re-enqueue if this block needs revisiting, 
+            if (needs_revisiting):
+                # This block shouldn't be in the pending pairs
+                assert(block_pair not in pending_block_pairs)
+                # Record the remapping table length and the queue composition,
+                # if the next time this pair is popped both are the same, don't
+                # allow revisiting. This prevents infinite loops when some
+                # operands can never be remapped.
+                # XXX There's probably something simpler than the whole queue
+                #     and the remapping table length we can tag on?
+                remapping_table_length_at_enqueue_time[block_pair] = Struct(
+                    remapping_table_length = original_remapping_table_length,
+                    pending_block_pairs_queue = original_pending_block_pairs_queue
+                )
+                
                 # XXX This could remove the completely remapped instructions
                 #     from the block
-                done_block_pairs.remove(block_pair)
                 pending_block_pairs_queue.append(block_pair)
+                pending_block_pairs.add(block_pair)
+                if (debug_queue):
+                    print "queued for revisit", [hash(b) for b in block_pair], 
+                    print [(hash(ba), hash(bb)) for ba, bb in pending_block_pairs_queue]
+            
+            else:
+                done_block_pairs.add(block_pair)
+            
+            
+        # Convert from set of blocks to text for the side by side texts
+        # Get the function header
+        fn_a_remapped = []
+        fn_a_unremapped = []
+        # convert to list to preserve order before adding function headers, 
+        # the header will be remapped below with the blocks
+        side_by_sides[fn_a.name] = list(side_by_sides[fn_a.name])
+        side_by_sides[fn_a.name].insert(0, [
+            str(fn_a).splitlines()[2],
+            str(fn_a).splitlines()[2]
+        ])
+        # Traverse headers + both blocks in the same order for easy text
+        # diffing, remap one
+        for block_a, block_b in side_by_sides[fn_a.name]:
+            fn_a_remapped.append(
+                re.sub(r"([^ ,\n]+)", lambda m: remapping_table.get(m.group(1), m.group(1)), str(block_b))
+            ),
+            fn_a_unremapped.append(str(block_a))
+        # Merge the strings in a single string
+        side_by_sides[fn_a.name] = [
+            string.join(fn_a_remapped, "\n"),
+            string.join(fn_a_unremapped, "\n")
+        ]
 
         mismatch_count += function_mismatch_count
-
+    
+    remapped_filepath = os.path.splitext(filepath_b)[0] + ".remapped.ll"
+    reordered_filepath = os.path.splitext(filepath_a)[0] + ".reordered.ll"
+    with open(remapped_filepath, "w") as f_remapped, open(reordered_filepath, "w") as f_reordered:
+        for fn_name, (fn_remapped_str, fn_reordered_str) in side_by_sides.iteritems():
+            f_remapped.write(fn_remapped_str)
+            f_reordered.write(fn_reordered_str)
+            f_remapped.write("\n\n")
+            f_reordered.write("\n\n")
+            
     return mismatches
 
 
+def generate_dot(llvm_ir_filepath):
+    with open(llvm_ir_filepath, "r") as f:
+        llvm_ir = f.read()
+        lib = llvm_compile(llvm_ir, [])
+        mod = lib.mod
+
+        for fn in mod.functions:
+            func = mod.get_function(fn.name)
+            dot = llvm.get_function_cfg(func, show_inst=True)
+            dot_filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_out", 
+                os.path.basename(llvm_ir_filepath) + "_" + fn.name + ".dot"
+            )
+            with open(dot_filepath, "w") as f:
+                f.write(dot)
+            invoke_dot(dot_filepath)
+
 if (__name__ == "__main__"):
-    # print llvm_ir_diff("_out/gold_function.c.optimized.ll", "_out/function.c.optimized.ll", "ffib")
+    
+    if (False):
+        # Direct diff tests
+        print llvm_ir_diff("_out/gold_function.c.optimized.ll", "_out/function.c.optimized.ll", "ffib")
+
+        generate_dot(R"_out\gold_if.c.ll")
+        #sys.exit()
 
     source = open("samples/current.c").read()
     lib = epycc_compile(source, True)
@@ -2526,4 +3240,19 @@ if (__name__ == "__main__"):
     print lib.ir_optimized
     #print lib.asm
     #print lib.asm_optimized
-    print lib.fsum_indirect1(10)
+
+    # Array parameter tests
+    if (True):
+        l = [[range(2) for __ in xrange(5)] for _ in xrange(10)]
+        print l
+        print lib.farray_3d_params(l, 12345)
+        print l
+
+        l = [range(5) for _ in xrange(10)]
+        print l
+        print lib.farray_2d_params(l, 12345)
+        print l
+        l = range(10)
+        print l
+        print lib.farray_1d_params(l, 67890)
+        print l
