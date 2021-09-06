@@ -169,13 +169,14 @@ Since the module includes a full featured C parser, it can also be used to parse
 
 ## Current functionality
 - [x] Parse all C99 code (only missing C lexer hack)
-- [x] Generate IR for floating point and integer expressions
+- [x] Generate IR for floating point and integer expressions, casts
 - [x] Generate IR for function definitions
 - [x] Generate IR for assigning / reading to / from function parameters and local scalar variables
 - [x] Generate IR for if then / else statements
 - [x] Generate IR for for/while continue/break statements
 - [x] Generate IR for internal function calls, forward function declarations, direct and indirect recursive functions
-- [x] Generate IR for arrays (runtime and compile time sized)
+- [x] Generate IR for arrays (open, runtime, and compile time sized)
+- [x] Generate IR for structs, arrays of structs, structs of arrays
 - [x] Execute generated IR seamlessly like a Python function
 - [x] "ctypable" transparent Python parameter passing support, including converting Python lists to C arrays under the hood
 
@@ -184,8 +185,8 @@ Check the [tests directory](tests/cfiles) for examples of the currently supporte
 
 ## Future functionality
 - [ ] Generate IR for switch statements
-- [ ] Generate IR for pointers, addressof operator
-- [ ] Generate IR for structs, user defined types, bitfields
+- [ ] Generate IR for pointers, sizeof, addressof operator
+- [ ] Generate IR for unions, user defined types, bitfields
 - [ ] Generate IR for vararg functions
 - [ ] Generate IR for global variables/constants
 - [ ] Generate IR for global constructors (via llvm.global_ctors or manually)

@@ -115,6 +115,24 @@ int farray_3d_params(int a[10][5][2], int b) {
     return a[5][2][1];
 }
 
+// Testing destructuring fixed size 2d array into 1d array
+int farray_2d_to_1d(int a[10][5], int b[5]) {
+    if (b[0] != 1) {
+        a[0][0] = 1;
+        farray_2d_to_1d(a, a[1]);
+    }
+    return a[1][0];
+}
+
+// Testing destructuring open 2d array into 1d array
+int farray_3d_to_1d(int a[][5], int b[5]) {
+    if (b[0] != 1) {
+        a[0][0] = 1;
+        farray_2d_to_1d(a, a[1]);
+    }
+    return a[1][0];
+}
+
 
 // XXX Test arrays of chars
 // XXX Test arrays of arrays

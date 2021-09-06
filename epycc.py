@@ -36,6 +36,7 @@ See
 - https://blog.yossarian.net/2020/09/19/LLVMs-getelementptr-by-example
 - https://www.reddit.com/r/programming/comments/ivuf99/llvms_getelementptr_by_example/
 - https://groups.seas.harvard.edu/courses/cs153/2019fa/lectures/Lec07-Datastructs.pdf
+- https://mapping-high-level-constructs-to-llvm-ir.readthedocs.io/en/latest/README.html
 """
 
 import ctypes
@@ -49,8 +50,17 @@ import struct
 from cstruct import Struct
 
 import lark
+# Monkey patch lark trees so they can compare to strings, see 
+# https://github.com/lark-parser/lark/issues/986
+# XXX Go through rules and remove .data and .value comparisons against strings
+#     and use straight node and token
+old_lark_tree_eq = lark.Tree.__eq__ 
+lark.Tree.__eq__ = lambda self, other: (self.data == other) if isinstance(other, str) else old_lark_tree_eq(self, other)
+
 import llvmlite.binding as llvm
 import llvmlite.ir as ir
+
+
 
 
 def unpack_op_sign_names(ops):
@@ -189,6 +199,9 @@ def type_is_scalar(t):
     # XXX Missing checking the symbol table for typedefs
     return isinstance(t, str)
 
+def type_is_struct_or_union(t):
+    return (isinstance(t, (dict, odict)))
+
 def type_is_array(t):
     return isinstance(t, list)
 
@@ -225,12 +238,42 @@ def build_type_from_dimensions(item_type, dims):
     # dimensions are indexed, eg 
     #   int c[5][4]; 
     #   type is [[int, 4], 5], so the type of c[5] is [int, 4]
-    for dim in reversed(dims):
-        assert ((dim is None) or (dim.type == "ir"))
-        array_type = [array_type, dim]
-    
+    if (dims is not None):
+        for dim in reversed(dims):
+            assert ((dim is None) or (dim.type == "ir"))
+            array_type = [array_type, dim]
+        
     return array_type
 
+
+def get_canonical_type(t):
+    """
+    Get the canonical type for a c type, ie specifier first, type second eg
+    "unsigned int" for "int unsigned"
+    
+    If the type is not a basic type, the type is returned unmodified
+    """
+    uncanonical_to_canonical_type = {
+        "char signed" : "signed char",
+        "char unsigned" : "unsigned char",
+        "int unsigned" : "unsigned int",
+        "int signed" : "signed int",
+        "unsigned" : "unsigned int",
+        "signed" : "signed int",
+        "long unsigned" : "unsigned long",
+        "long signed" : "signed long",
+        "long unsigned long" : "unsigned long long",
+        "long long unsigned" : "unsigned long long",
+        "long signed long" : "signed long long",
+        "long long signed" : "signed long long",
+        "double long" : "long double"
+    }
+
+    if (isinstance(t, str)):
+        t = uncanonical_to_canonical_type.get(t, t)
+
+    return t
+    
 
 def get_llvm_type_ext(t):
     """
@@ -369,6 +412,9 @@ def get_llvmlite_type(t):
     #   typedef struct { int i; float f; } S; S ss[10]; 
     #   - S is "S"
     #   - ss is ["S", 10]
+    #  Unions can be a regular dict since they don't need to be ordered
+    #  Bitfields can use colon-type notation
+    # struct { int i:2; int j:3; } odict({'i' : "int:3"
     
     if (isinstance(t, str)):
         # Primitive type
@@ -389,13 +435,12 @@ def get_llvmlite_type(t):
 
     elif (isinstance(t, odict)):
         # Struct
-        assert False, "Unsupported struct"
-
+        llvmlite_type = ir.LiteralStructType(get_llvmlite_type(field_type) for field_type in t.values())
+        
     else:
         assert False, "Unexpected type %s" % repr(t)
 
     return llvmlite_type
-
 
 def get_ctype(t):
     """
@@ -970,17 +1015,16 @@ def generate_ir(generator, node):
             a_ir_type = get_llvmlite_type(a_type)
 
             if (not hasattr(sym, "ir_ref")):
-                if (type_is_scalar(a_type)):
-                    # Scalar variable
-
-                    # Create allocas for regular variables and fixed size arrays
-                    # in the entry block so they are available everywhere even
-                    # across disjoint basic blocks and don't get reallocated
-                    # inside loops, etc
-                    with generator.llvmir.builder.goto_entry_block():
-                        sym.ir_ref = generator.llvmir.builder.alloca(a_ir_type)
-
-                elif (type_is_array(a_type) and (
+                if (
+                    # Scalar variables
+                    type_is_scalar(a_type) or 
+                    # Structs (note structs are always compile-time size, by C99
+                    # spec they can't contain runtime sized arrays)
+                    type_is_struct_or_union(a_type) or
+                    # Compile-time sized arrays, top level open containing
+                    # compile-time sized arrays, or single-level open array
+                    (
+                        (type_is_array(a_type) and (
                         type_is_compile_time_sized_array(a_type) or
                         (
                             # Open array of compile-time sized arrays or single
@@ -990,15 +1034,16 @@ def generate_ir(generator, node):
                                 (not type_is_array(a_type[0])) or 
                                 (type_is_compile_time_sized_array(a_type[0]))
                             ))
-                        )
-                    )):
-                    # Statically sized array or pointer to statically sized
+                        )))
+                    )
+                    ):
                     
-                    # Create alloca in the entry block so it doesn't get
-                    # continuously allocated 
+                    # Create allocas in the entry block so they are available
+                    # everywhere even across disjoint basic blocks and don't get
+                    # reallocated inside loops, etc
                     with generator.llvmir.builder.goto_entry_block():
                         sym.ir_ref = generator.llvmir.builder.alloca(a_ir_type)
-                
+
                 else:
                     # XXX Missing dealing with None dimensions, should look at
                     #     the initializer to guess the size or do an infinite
@@ -1208,18 +1253,35 @@ def generate_ir(generator, node):
 
         return res_ir_reg
 
-    def generate_call_ir(generator, fn_name, arg_ir_reg_types):
+    def generate_call_ir(generator, fn_name, arg_ir_ref_reg_types):
         
         fn = generator.symbol_table[fn_name]
 
         arg_ir_regs = []
-        for (arg_ir_reg, arg_type), parameter in zip(arg_ir_reg_types, fn.parameters):
+        for (arg_ir_ref, arg_ir_reg, arg_type), parameter in zip(arg_ir_ref_reg_types, fn.parameters):
             # Convert each argument to the parameter type
-            if (arg_type != parameter.value_type):
-                arg_ir_reg = generate_extern_call_ir(generator, 
-                    get_fn_name("cnv", parameter.value_type, arg_type), 
-                    parameter.value_type, 
-                    [arg_type, arg_ir_reg]
+            
+            # XXX Converting the type to str easily deals with comparing complex
+            #     types, but it's hacky, change to a proper deep comparison?
+            if (str(arg_type) != str(parameter.value_type)):
+                # If parameter is a pointer and argument is a compatible array,
+                # lower to  pointer with a magic 0, 0 index getelementptr
+                if (
+                        # Array vs. pointer
+                        type_is_array(parameter.value_type) and
+                        type_is_array(arg_type) and
+                        (parameter.value_type[1] is None) and
+                        # same element type
+                        (parameter.value_type[0] == arg_type[0])
+                    ):
+                    inds = [ir.IntType(32)(0), ir.IntType(32)(0)]
+                    arg_ir_reg = generator.llvmir.builder.gep(arg_ir_ref, inds, True)
+
+                else:
+                    arg_ir_reg = generate_extern_call_ir(generator, 
+                        get_fn_name("cnv", parameter.value_type, arg_type), 
+                        parameter.value_type, 
+                        [arg_type, arg_ir_reg]
                 )
             
             arg_ir_regs.append(arg_ir_reg)
@@ -1407,13 +1469,13 @@ def generate_ir(generator, node):
 
                 fn_name = gen_node.value
                 
-                arg_ir_reg_types = []
+                arg_ir_ref_reg_types = []
                 if (node.children[2] != ")"):
                     # Collect parameters
                     gen_node = generate_ir(generator, node.children[2])
-                    arg_ir_reg_types = [get_ir_reg_and_type(a) for a in gen_node]
+                    arg_ir_ref_reg_types = [get_ir_ref_reg_and_type(a) for a in gen_node]
 
-                res_ir_reg, res_type = generate_call_ir(generator, fn_name, arg_ir_reg_types)
+                res_ir_reg, res_type = generate_call_ir(generator, fn_name, arg_ir_ref_reg_types)
                 gen_node = Struct(type="ir", value_type=res_type, ir_reg=res_ir_reg)
 
             elif (node.children[1] == "["):
@@ -1522,6 +1584,24 @@ def generate_ir(generator, node):
                 # Lower the C type by removing the last dimension
                 gen_node = Struct(type="ir", value_type=a_type[0], ir_reg=ir_reg, ir_ref=ptr)
 
+            elif (node.children[0].data == "postfix_expression"):
+                # |  postfix_expression "." identifier
+                gen_node = generate_ir(generator, node.children[0])
+                identifier = generate_ir(generator, node.children[2])
+
+                ir_ref, ir_reg, a_type = get_ir_ref_reg_and_type(gen_node)
+
+                assert(type_is_struct_or_union(a_type))
+
+                field_index = a_type.keys().index(identifier.value)
+                field_name = a_type.keys()[field_index]
+                ptr = generator.llvmir.builder.gep(ir_ref, [ir.IntType(32)(0), ir.IntType(32)(field_index)], True)
+                # XXX Generating this is probably overkill most of the time
+                ir_reg = generator.llvmir.builder.load(ptr)
+
+                # Lower the type to the field type
+                gen_node = Struct(type="ir", value_type=a_type[field_name], ir_reg=ir_reg, ir_ref=ptr)
+
             else:
                 # XXX Support the rest of postfix_expression
                 assert False, "Unhandled postfix_expression %s" % node
@@ -1568,16 +1648,19 @@ def generate_ir(generator, node):
                 gen_node = generate_ir(generator, node.children[0])
                 res_type = None
 
-            a_ir_reg, a_type = get_ir_reg_and_type(gen_node)
+            a_ir_ref, a_ir_reg, a_type = get_ir_ref_reg_and_type(gen_node)
             
             if ((res_type is not None) and (res_type != a_type)):
                 res_ir_reg = generate_extern_call_ir(generator, 
                     get_fn_name("cnv", res_type, a_type), res_type, [a_type, a_ir_reg])
+                res_ir_ref = None
+
             else:
                 res_ir_reg = a_ir_reg
                 res_type = a_type
+                res_ir_ref = a_ir_ref
 
-            gen_node = Struct(type="ir", value_type=res_type, ir_reg=res_ir_reg)
+            gen_node = Struct(type="ir", value_type=res_type, ir_reg=res_ir_reg, ir_ref=res_ir_ref)
 
         elif (node.data == "primary_expression"):
             # primary_expression:  identifier
@@ -1726,6 +1809,8 @@ def generate_ir(generator, node):
             
             # Read return type
             function_type = generate_ir(generator, node.children[0])
+            # XXX Missing dealing with inline, const, etc
+            function_type = get_canonical_type(function_type)
             
             # Read name and parameters
             gen_node = generate_ir(generator, node.children[1])
@@ -1823,7 +1908,8 @@ def generate_ir(generator, node):
                 gen_node.append(generate_ir(generator, child))
 
             parameter_name = None
-            parameter_type = gen_node[0]
+            # XXX Missing dealing with inline, const, etc
+            parameter_type = get_canonical_type(gen_node[0])
             if (len(gen_node) > 1):
                 assert (isinstance(gen_node[1], str) or (
                     isinstance(gen_node[1], Struct) and gen_node[1].type == "identifier"))
@@ -1869,6 +1955,10 @@ def generate_ir(generator, node):
             # declaration contains one type and one or more identifiers and or
             # initializerss
 
+            decl_type = generate_ir(generator, node.children[0])
+            # XXX Missing dealing with inline, const, etc
+            decl_type = get_canonical_type(decl_type)
+
             if (len(generator.symbol_table) == 1):
                 # Global scope declaration
                 
@@ -1879,7 +1969,7 @@ def generate_ir(generator, node):
                     (get_grandson(node, [1, 0, 0, 0, 1]).value == "(")
                 ), "Only function forward declarations supported!!!"
                 
-                function_type = generate_ir(generator, node.children[0])
+                function_type = decl_type
                 # Gather the function parameters
                 # XXX This has some unnecessary nesting, find the culprit and
                 #     flatten it?
@@ -1905,14 +1995,10 @@ def generate_ir(generator, node):
                     
                 # Register the variable and create an IR node to hold the
                 # initializer, if any
-                decl_type = generate_ir(generator, node.children[0])
+            
                 for identifier, initializer in gen_node:
-                    if (identifier.dims is None):
-                        # No dimensions
-                        dims = None
-
-                    else:
-                        decl_type = build_type_from_dimensions(decl_type, identifier.dims)
+                    assert(isinstance(identifier, Struct) and hasattr(identifier, "dims"))
+                    decl_type = build_type_from_dimensions(decl_type, identifier.dims)
                         
                     variable = Struct(
                         type="variable", 
@@ -1923,16 +2009,101 @@ def generate_ir(generator, node):
                     generator.symbol_table[identifier.value] = variable
                     
                     if (initializer is not None):
-                        # XXX This should come from gen_node instead of having
-                        #     to recreate it here?
-                        a = Struct(type="identifier", value=identifier.value)
-                        b = initializer
-
-                        generate_assign_ir(generator, a, b)
+                        # Initialize the identifier
+                        assert(isinstance(initializer, Struct) and (initializer.type == "ir"))
+                        generate_assign_ir(generator, identifier, initializer)
                         
             gen_node = Struct(type="ir", value_type="void", ir_reg=None)
 
-        elif(node.data == "direct_declarator"):
+        elif (node.data == "struct_or_union_specifier"):
+            # struct_or_union_specifier:  struct_or_union identifier? "{" struct_declaration_list "}"
+            # |  struct_or_union identifier
+            
+            # Struct definition
+            if (len(node.children) > 2):
+                if (get_grandson(node, [0, 0]) == "struct"):
+                    # Struct
+                    d = odict()
+                else:
+                    # Union
+                    # XXX Unions in LLVM are just the single largest field
+                    #     written to via bitcast
+                    assert False, "Unions not supported yet"
+                    d = dict()
+                
+                # XXX Handle identifier after struct_or_union
+                assert len(node.children) == 4, "Struct declaration not supported!!"
+
+                item_type_identifiers = generate_ir(generator, node.children[-2])
+                # This returns a list of c type and name or names
+                assert(isinstance(item_type_identifiers, list) and isinstance(item_type_identifiers[0], list))
+                d = odict()
+                for item_type, identifiers in item_type_identifiers:
+                    for identifier in identifiers:
+                        field_type = build_type_from_dimensions(item_type, identifier.dims)
+                        d[identifier.value] = field_type
+
+                return d
+
+            else:
+                assert False, "Struct declaration not supported!!"
+
+        elif (node.data == "struct_declaration_list"):
+            # struct_declaration_list:  struct_declaration
+            # |  struct_declaration_list struct_declaration
+            # XXX Should unify all the _list? (note this list has no separator)
+            if (len(node.children) == 1):
+                gen_node = [generate_ir(generator, node.children[0])]
+            else:
+                gen_node = generate_ir(generator, node.children[0])
+                gen_node.append(generate_ir(generator, node.children[1]))
+
+        elif (node == "specifier_qualifier_list"):
+            # specifier_qualifier_list:  type_specifier specifier_qualifier_list?
+            # |  type_qualifier specifier_qualifier_list?
+            # XXX Should unify all the _list= (note this is right recursive)
+
+            gen_node = generate_ir(generator, node.children[0])
+            # The type can be a str for a basic type/typedef or an odict for
+            # struct
+            assert isinstance(gen_node, (str, odict)), "Expected str, odict, found %s" % gen_node
+            gen_node = [gen_node]
+            if (len(node.children) > 1):
+                gen_node.extend(generate_ir(generator, node.children[1]))
+
+        elif (node.data == "struct_declaration"):
+            # struct_declaration:  specifier_qualifier_list struct_declarator_list ";"
+
+            # Collect into pair type, names and bubble up
+            res_type = generate_ir(generator, node.children[0])
+            # We expect a list of strings or a single element list of complex types
+            # XXX Missing dealing with inline, const, etc
+            assert isinstance(res_type, list), "Expected list, found %s" % res_type
+            assert (len(res_type) == 1) or isinstance(res_type[0], str), "Expected single complex type or >=1 basic types, found %s" % field_type 
+            # Unbox/canonicalize the types
+            if (isinstance(res_type[0], str)):
+                # Join all specifiers plus type a canonical type
+                res_type = string.join(res_type, " ")
+                res_type = get_canonical_type(res_type)
+
+            else:
+                res_type = res_type[0]
+
+            res_names = generate_ir(generator, node.children[1])
+
+            gen_node = [res_type, res_names]
+
+        elif (node.data == "struct_declarator_list"):
+            # struct_declarator_list:  struct_declarator
+            # |  struct_declarator_list "," struct_declarator
+            # XXX Should unify all the _list?
+            if (len(node.children) == 1):
+                gen_node = [generate_ir(generator, node.children[0])]
+            else:
+                gen_node = generate_ir(generator, node.children[0])
+                gen_node.append(generate_ir(generator, node.children[2]))
+
+        elif (node.data == "direct_declarator"):
             # direct_declarator:  identifier
             # |  "(" declarator ")"
             # |  direct_declarator "[" type_qualifier_list? assignment_expression? "]"
@@ -1971,7 +2142,7 @@ def generate_ir(generator, node):
                 
                 gen_node = generate_ir(generator, node.children[0])
                 assert isinstance(gen_node, str) or isinstance(gen_node, Struct)
-                if (len(node.children) == 2):
+                if (len(node.children) == 3):
                     # Unsized array, return None dimensions
                     dim = None
 
@@ -2056,19 +2227,61 @@ def generate_ir(generator, node):
         elif (node.data == "identifier"):
             gen_node = Struct(type="identifier", value=node.children[0].value, dims=None)
 
-        elif ((node.data == "type_name") or (node.data == "declaration_specifiers")):
-            # type_name:  specifier_qualifier_list abstract_declarator?
+        elif (node.data == "declaration_specifiers"):
             # declaration_specifiers:  storage_class_specifier declaration_specifiers?
             #   |  type_specifier declaration_specifiers?
             #   |  type_qualifier declaration_specifiers?
             #   |  function_specifier declaration_specifiers?
 
-            # XXX Right now assume there's only one type and it's one of the
-            #     basic types, once complex types are supported, the types will
-            #     have to be put in the symbol table and parsed properly
-            res_type = get_tree_tokens(node)
-            res_type = string.join(res_type, " ")
+            # This is a right recursive list, collect
+            if (node.children[0].data == "type_specifier"):
+
+                # Concatenate str types (ie multiple specifiers), leave others
+                # (struct, union...) alone
+                # XXX What about "const struct", etc...
+                gen_node = generate_ir(generator, node.children[0])
+                if (len(node.children) > 1):
+                    # Note in order to canonicalize the full type is needed, so
+                    # this gets canonicalized at usage time in declaration,
+                    # function_definition and parameter_declaration
+                    
+                    assert(isinstance(gen_node, str))
+                    new_node = generate_ir(generator, node.children[1])
+                    assert(isinstance(new_node, str))
+                    gen_node = gen_node + " " + new_node
+                
+            else:
+                # XXX Right now assume there's only one type and it's one of the
+                #     basic types, once complex types are supported, the types will
+                #     have to be put in the symbol table and parsed properly
+            
+                res_type = string.join(res_type, " ")
+                gen_node = res_type
+
+        elif (node.data == "type_name"):
+            # type_name:  specifier_qualifier_list abstract_declarator?
+            assert (len(node.children) == 1), "Pointers not supported yet"
+
+            # Collect into single type and bubble up
+            res_type = generate_ir(generator, node.children[0])
+            # We expect a list of strings or a single element list of complex types
+            # XXX Missing dealing with inline, const, etc
+            assert isinstance(res_type, list), "Expected list, found %s" % res_type
+            assert (len(res_type) == 1) or isinstance(res_type[0], str), "Expected single complex type or >=1 basic types, found %s" % field_type 
+            # Unbox/canonicalize the types
+            if (isinstance(res_type[0], str)):
+                # Join all specifiers plus type a canonical type
+                res_type = string.join(res_type, " ")
+                res_type = get_canonical_type(res_type)
+
+            else:
+                res_type = res_type[0]
+
             gen_node = res_type
+
+            # Lists shouldn't get here since we unboxed above and don't expect
+            # array types, only structs
+            assert not isinstance(gen_node, list), "List not expected, found %s" % res_type
 
         elif (node.data == "iteration_statement"):
             # iteration_statement:  "while" "(" expression ")" statement
@@ -2486,6 +2699,7 @@ def llvm_compile(llvm_ir, function_signatures):
 
         # Obtain a pointer to the function via ctypes
         cfunc = ctypes.CFUNCTYPE(*function_signature.ctypes)(func_ptr)
+        raw_cfunc = cfunc
         
         # Convert the Python arguments to ctype arguments by wrapping the ctype
         # function in a Python wrapper
@@ -2536,7 +2750,7 @@ def llvm_compile(llvm_ir, function_signatures):
                                 else:
                                     l[i] = c_arr[i]
 
-                        deepcopy_list(arg, c_arr)
+                        deepcopy_list(arg, _arg)
 
                     # XXX Other copybacks probably missing like structs, etc
                     #     May go through the pointer path?
@@ -2547,6 +2761,7 @@ def llvm_compile(llvm_ir, function_signatures):
             cfunc = functools.partial(wrapper, cfunc)
         
         setattr(jit_lib, function_signature.name, cfunc)
+        setattr(jit_lib, "__raw_" + function_signature.name, raw_cfunc)
 
     # XXX Missing publishing the globals once there's global support
         
@@ -3242,7 +3457,8 @@ if (__name__ == "__main__"):
     #print lib.asm_optimized
 
     # Array parameter tests
-    if (True):
+    print lib.fstruct_nested(1, 2)
+    if (False):
         l = [[range(2) for __ in xrange(5)] for _ in xrange(10)]
         print l
         print lib.farray_3d_params(l, 12345)
