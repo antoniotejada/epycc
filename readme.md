@@ -1,6 +1,6 @@
 # Epycc: Embedded Python C Compiler
 
-Embedded Python C Compiler is a Python 2.7 module that allows JIT compiling and invoking C code seamlessly from Python, as if it was a Python function, but at native non-interpreted execution speeds (faster than numpy or numba, see [Performance](Performance) below).
+Embedded Python C Compiler is a Python 2.7 module that allows JIT compiling and invoking C code seamlessly from Python, as if it was a Python function, but at native non-interpreted execution speeds (faster than numpy or numba, see [Performance](#performance) below).
 
 ```python
 c_code = """
