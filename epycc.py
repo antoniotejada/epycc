@@ -37,6 +37,7 @@ See
 - https://www.reddit.com/r/programming/comments/ivuf99/llvms_getelementptr_by_example/
 - https://groups.seas.harvard.edu/courses/cs153/2019fa/lectures/Lec07-Datastructs.pdf
 - https://mapping-high-level-constructs-to-llvm-ir.readthedocs.io/en/latest/README.html
+- https://stackoverflow.com/questions/42138764/marshaling-object-code-for-a-numba-function
 """
 
 import ctypes
@@ -487,6 +488,8 @@ def get_ctype(t):
             # Runtime sized array or pointer
             assert((t[1] is None) or (isinstance(t[1], Struct)))
             ctype = ctypes.POINTER(get_ctype(t[0]))
+            # XXX This makes parameter overhead lower?
+            #ctype = ctypes.c_void_p
             
     else:
         # XXX Missing structs
@@ -2584,21 +2587,33 @@ def llvm_compile(llvm_ir, function_signatures):
         # And an execution engine with an empty backing module
         backing_mod = llvm.parse_assembly("")
         engine = llvm.create_mcjit_compiler(backing_mod, target_machine)
+
+        save_module_obj = False
+        if (save_module_obj):
+            # This gets called by LLVM when a module has been compiled and it's
+            # passed the object code that can be disassembled via objdump -d
+            # It gets called at engine.finalize_object time, and only once and
+            # for the last compilation (unoptimized or optimized)
+            def on_compiled(module, objbytes):
+                count = getattr(on_compiled, "count", 0)
+                open(os.path.join("_out", os.path.basename(__file__) + '-%03d.o' % count), 'wb').write(objbytes)
+                count += 1
+                on_compiled.count = count
+
+            # set_object_cache can also be used to inject binaries in the 
+            # cache by defining the second function object_cache_get_buffer
+            engine.set_object_cache(on_compiled, lambda m: None)
+            
         return engine
 
 
-    def compile_ir(engine, llvm_ir):
+    def compile_ir(llvm_ir):
         """
-        Compile the LLVM IR string with the given engine.
-        The compiled module object is returned.
+        Compile the LLVM IR string. The compiled module object is returned.
         """
         # Create a LLVM module object from the IR
         mod = llvm.parse_assembly(llvm_ir)
         mod.verify()
-        # Now add the module and make sure it is ready for execution
-        engine.add_module(mod)
-        engine.finalize_object()
-        engine.run_static_constructors()
         
         return mod
 
@@ -2638,23 +2653,13 @@ def llvm_compile(llvm_ir, function_signatures):
     jit_lib = Struct(ir = llvm_ir)
 
     target_machine = create_target_machine()
-    engine = create_execution_engine(target_machine)
-    mod = compile_ir(engine, llvm_ir)
-
+    mod = compile_ir(llvm_ir)
 
     # XXX All the attributes should probably go under some safe prefix to
     #     prevent from colliding with the user-defined functions that are being
     #     compiled or under the function name, but most of them are for the
     #     whole jit_lib, not per function
     
-
-    # XXX Need to keep some of these around to prevent access violations when
-    #     calling the function right after leaving this function, presumably
-    #     because of garbage collection, find out which ones
-    
-    jit_lib.mod = mod
-    jit_lib.tm = target_machine
-    jit_lib.engine = engine
     jit_lib.asm = target_machine.emit_assembly(mod)
     jit_lib.ir = str(mod)
 
@@ -2683,6 +2688,28 @@ def llvm_compile(llvm_ir, function_signatures):
 
     jit_lib.ir_optimized = str(mod)
     jit_lib.asm_optimized = target_machine.emit_assembly(mod)
+
+    # Create the engine and add the module to the engine now that the module has
+    # been compiled and optimized. Cannot be added before optimizing or the code
+    # being executed will be the unoptimized one.
+    # XXX Note that if the module is added to the engine before obtaining the
+    #     optimized IR, the optimized IR changes subtly enough (getelementptr
+    #     changed to bitcast) to fail the 2d_to_1d array tests and others,
+    #     investigate?
+    engine = create_execution_engine(target_machine)
+    engine.add_module(mod)
+    # Finalize the object, this will cause the compile notify callbacks in the
+    # object cache to be triggered
+    engine.finalize_object()
+    # XXX Not clear this is the right place to run the static constructors?
+    engine.run_static_constructors()
+
+    # XXX Need to keep some of these around to prevent access violations when
+    #     calling the function right after leaving this function, presumably
+    #     because of garbage collection, find out which ones
+    jit_lib.mod = mod
+    jit_lib.tm = target_machine
+    jit_lib.engine = engine
     
     for function_signature in function_signatures:
 
@@ -2707,9 +2734,11 @@ def llvm_compile(llvm_ir, function_signatures):
                 [(issubclass(ctype, ctypes.Array) or issubclass(ctype, ctypes._Pointer)) 
                 for ctype in function_signature.ctypes[1:]]
             )):
-            # Nested arrays need to be converted to nested tuples
+            # Nested lists need to be converted to nested tuples
             def wrapper(_cfunc, *args):
                 def tuplize(a):
+                    # XXX This assumes that once it finds a tuple everything 
+                    #     is tuples all the way
                     if (isinstance(a, list)):
                         l = []
                         for i in a:
@@ -2750,7 +2779,11 @@ def llvm_compile(llvm_ir, function_signatures):
                                 else:
                                     l[i] = c_arr[i]
 
-                        deepcopy_list(arg, _arg)
+                        # Can't copy back tuples, only lists
+                        # XXX This assumes that there are no lists if the 
+                        #     topmost is not list
+                        if (isinstance(arg, list)):
+                            deepcopy_list(arg, _arg)
 
                     # XXX Other copybacks probably missing like structs, etc
                     #     May go through the pointer path?
